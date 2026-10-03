@@ -14,6 +14,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`status` reported a nearly full device as nearly empty, and vice versa.**
+  `APP&SPACE` answers with *free* and total storage in **MB**
+  (`MCU&SPA&<free>&<total>`), not used and total in KB. A brand-new 64 GB
+  device showed `59,619 / 59,634 KB (99% used)`; it now shows
+  `15 / 59,634 MB (0% used)`. `get_storage()` still returns
+  `(used, total)`, now in MB, and the web API's `storage_used_kb` /
+  `storage_total_kb` are now `storage_used_mb` / `storage_total_mb`.
+  Reported on firmware 1.7 in
+  [#11](https://github.com/shahcolate/pocket-libre/issues/11).
 - **A BLE disconnect mid-download crashed `download-all`** with `BleakError:
   Service Discovery has not been performed yet`, raised while unsubscribing
   from a link that was already gone. Without the crash it was worse: the

@@ -398,7 +398,7 @@ def status(ctx, address: str | None, session_key: str | None):
             console.print(Panel(
                 f"[bold]Battery:[/bold] {battery}%\n"
                 f"[bold]Firmware:[/bold] {firmware}\n"
-                f"[bold]Storage:[/bold] {used:,} / {total:,} KB ({pct}% used)\n"
+                f"[bold]Storage:[/bold] {used:,} / {total:,} MB ({pct}% used)\n"
                 f"[bold]State:[/bold] {state_names.get(state, f'Unknown ({state})')}\n"
                 f"[bold]Time:[/bold] Synced to host",
                 title="Pocket Status",

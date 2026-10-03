@@ -180,13 +180,17 @@ class PocketCommander:
         return vals[0].strip() if vals else "unknown"
 
     async def get_storage(self) -> tuple[int, int]:
-        """Returns (used_kb, total_kb)."""
+        """Returns (used_mb, total_mb).
+
+        The device answers MCU&SPA&<free>&<total> in MB, so used is derived.
+        """
         responses = await self._send("SPACE")
         vals = self._parse_response(responses, "SPA")
         if vals:
             parts = vals[0].split("&")
-            if len(parts) == 2:
-                return int(parts[0]), int(parts[1])
+            if len(parts) == 2 and all(p.strip().isdigit() for p in parts):
+                free, total = int(parts[0]), int(parts[1])
+                return max(total - free, 0), total
         return 0, 0
 
     async def get_state(self) -> int:

@@ -182,8 +182,8 @@ async def device_status():
                 return {
                     "battery": battery,
                     "firmware": firmware,
-                    "storage_used_kb": used,
-                    "storage_total_kb": total,
+                    "storage_used_mb": used,
+                    "storage_total_mb": total,
                     "state": state,
                     "state_name": {0: "Idle", 1: "Recording"}.get(state, f"Unknown ({state})"),
                     "address": address,

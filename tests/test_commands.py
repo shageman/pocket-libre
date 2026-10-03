@@ -28,8 +28,25 @@ def test_parse_response_empty_when_no_match(cmd):
 
 
 def test_parse_response_keeps_embedded_separators(cmd):
-    """SPACE returns "used&total" — the split must not eat the payload."""
+    """SPACE returns "free&total" — the split must not eat the payload."""
     assert cmd._parse_response(["MCU&SPA&1024&4096"], "SPA") == ["1024&4096"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "responses, expected",
+    [
+        # A brand-new 64 GB device on firmware 1.7 (issue #11): 15 MB used.
+        (["MCU&SPA&059619&059634"], (15, 59634)),
+        (["MCU&SPA&0&4096"], (4096, 4096)),
+        ([], (0, 0)),
+        (["MCU&SPA&1024"], (0, 0)),
+        (["MCU&SPA&lots&4096"], (0, 0)),
+    ],
+)
+async def test_get_storage_reads_free_and_total_mb(cmd, monkeypatch, responses, expected):
+    monkeypatch.setattr(cmd, "_send", _FakeSend(responses))
+    assert await cmd.get_storage() == expected
 
 
 # ── Recording ───────────────────────────────────

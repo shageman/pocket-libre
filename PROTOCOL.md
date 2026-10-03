@@ -52,7 +52,7 @@ The 16-character session key authenticates the connection. Capture yours from an
 | `APP&BAT` | `MCU&BAT&58` | Battery percentage |
 | `APP&FW` | `MCU&FW&1.3.3` | Firmware version |
 | `APP&WF` | `MCU&WF&V6` | WiFi firmware version |
-| `APP&SPACE` | `MCU&SPA&060846&061032` | Storage used & total (KB) |
+| `APP&SPACE` | `MCU&SPA&060846&061032` | Storage free & total (MB) |
 | `APP&STE` | `MCU&STE&0` | Device state (0=idle) |
 | `APP&T&YYYYMMDDHHmmss` | `MCU&T&OK` | Set device clock |
 | `APP&REC&SECEN` | `MCU&REC&CON` | Recording config |
