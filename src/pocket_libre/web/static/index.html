@@ -305,7 +305,7 @@ async function refreshStatus() {
     dot.className = 'status-dot connected';
     dot.title = 'Connected';
 
-    const storagePct = d.storage_total_kb > 0 ? Math.round(100 * d.storage_used_kb / d.storage_total_kb) : 0;
+    const storagePct = d.storage_total_mb > 0 ? Math.round(100 * d.storage_used_mb / d.storage_total_mb) : 0;
     el.innerHTML = `
       <div class="stat-grid">
         <div class="stat"><div class="value">${d.battery}%</div><div class="label">Battery</div></div>
