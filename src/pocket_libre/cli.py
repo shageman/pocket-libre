@@ -571,9 +571,12 @@ def _plan_downloads(jobs: list[tuple[Recording, Path]], listed: int,
                    "recording's folder on the device, in UTC.")
 @click.option("--process", "do_process", is_flag=True, help="Transcribe and summarize after download.")
 @click.option("--output-dir", default=None, help="Output directory.")
+@click.option("--delete-after", is_flag=True,
+              help="Afterwards, delete every recording with a complete local copy from the device.")
 @click.pass_context
 def download_all(ctx, address: str | None, session_key: str | None,
-                 since: str | None, do_process: bool, output_dir: str | None):
+                 since: str | None, do_process: bool, output_dir: str | None,
+                 delete_after: bool):
     """Download all recordings from the device.
 
     \b
@@ -659,7 +662,117 @@ def download_all(ctx, address: str | None, session_key: str | None,
                        anthropic_key=None, hf_token=None, skip_summary=False,
                        output=str(path.parent))
 
+    if delete_after:
+        _delete_downloaded(address, session_key, out_root, since, assume_yes=True)
     if failed:
+        raise SystemExit(1)
+
+
+# ── Deleting ────────────────────────────────────
+
+
+async def _delete_recordings(address: str, session_key: str,
+                             recs: list[Recording]) -> int:
+    """Delete `recs` from the device over one connection. Returns how many went."""
+    deleted = 0
+    async with PocketCommander(address) as cmd:
+        if not await cmd.authenticate(session_key):
+            raise click.ClickException("Authentication failed.")
+        for rec in recs:
+            # delete() checks the listing afterwards, which can't tell a
+            # deletion from a recording that was never there.
+            if all(r.timestamp != rec.timestamp for r in await cmd.list_files(rec.date)):
+                console.print(f"  [red]{rec.date}/{rec.timestamp} is not on the device.[/red]")
+                continue
+            if await cmd.delete(rec):
+                deleted += 1
+                console.print(f"  [green]Deleted {rec.date}/{rec.timestamp}[/green]")
+            else:
+                console.print(f"  [red]{rec.date}/{rec.timestamp} is still on the device.[/red]")
+    return deleted
+
+
+def _delete_downloaded(address: str, session_key: str, out_root: Path,
+                       since: str | None, assume_yes: bool) -> None:
+    """Delete from the device every recording with a complete copy under out_root."""
+    from pocket_libre.commands import has_complete_copy
+
+    async def _list() -> list[Recording]:
+        async with PocketCommander(address) as cmd:
+            if not await cmd.authenticate(session_key):
+                raise click.ClickException("Authentication failed.")
+            return await cmd.list_all_recordings()
+
+    console.print("\n[bold]Removing downloaded recordings from the device...[/bold]")
+    recs = asyncio.run(_list())
+    if since:
+        recs = [r for r in recs if r.date >= since]
+    done = [r for r in recs if has_complete_copy(r, out_root / r.date / r.filename)]
+    for r in recs:
+        if r not in done:
+            console.print(f"  [yellow]Keeping {r} (no complete copy in {out_root})[/yellow]")
+    if not done:
+        console.print("[dim]Nothing to delete.[/dim]")
+        return
+    if not assume_yes:
+        for r in done:
+            console.print(f"  {r}")
+        click.confirm(f"Delete these {len(done)} recording(s) from the device? "
+                      "This can't be undone", abort=True)
+    deleted = asyncio.run(_delete_recordings(address, session_key, done))
+    console.print(f"[bold]{deleted} of {len(done)} recording(s) deleted from the device.[/bold]")
+    if deleted < len(done):
+        raise SystemExit(1)
+
+
+@cli.command()
+@click.option("--address", default=None, help="BLE address of your Pocket device.")
+@click.option("--key", "session_key", default=None, help="Session key.")
+@click.option("--date", default=None, help="Recording date (YYYY-MM-DD), with --timestamp.")
+@click.option("--timestamp", default=None, help="Recording timestamp, with --date.")
+@click.option("--downloaded", is_flag=True,
+              help="Delete every recording that has a complete copy in the output directory.")
+@click.option("--output-dir", default=None,
+              help="With --downloaded: where the copies are (default: the configured one).")
+@click.option("--since", default=None,
+              help="With --downloaded: only recordings from this date (YYYY-MM-DD) on.")
+@click.option("--yes", "assume_yes", is_flag=True, help="Don't ask for confirmation.")
+@click.pass_context
+def delete(ctx, address: str | None, session_key: str | None, date: str | None,
+           timestamp: str | None, downloaded: bool, output_dir: str | None,
+           since: str | None, assume_yes: bool):
+    """Delete recordings from the device. This can't be undone.
+
+    \b
+    One recording with --date and --timestamp, or with --downloaded every
+    recording whose <output dir>/<date>/<timestamp>.mp3 is complete;
+    recordings without a local copy are kept.
+    """
+    from pocket_libre.commands import is_safe_id
+
+    if downloaded == (date is not None or timestamp is not None):
+        raise click.UsageError("Pass either --date and --timestamp, or --downloaded.")
+    if not downloaded and (date is None or timestamp is None):
+        raise click.UsageError("Pass --date and --timestamp together.")
+    if not downloaded and not (is_safe_id(date) and is_safe_id(timestamp)):
+        raise click.UsageError("--date and --timestamp must be plain identifiers.")
+    if not downloaded and (output_dir or since):
+        raise click.UsageError("--output-dir and --since go with --downloaded.")
+
+    config = ctx.obj["config"]
+    address = _require_address(address, config)
+    session_key = _require_session_key(session_key, config)
+
+    if downloaded:
+        out_root = Path(get_output_dir(config, output_dir))
+        _delete_downloaded(address, session_key, out_root, since, assume_yes)
+        return
+
+    rec = Recording(date=date, timestamp=timestamp, duration_s=0)
+    if not assume_yes:
+        click.confirm(f"Delete {date}/{timestamp} from the device? This can't be undone",
+                      abort=True)
+    if not asyncio.run(_delete_recordings(address, session_key, [rec])):
         raise SystemExit(1)
 
 
@@ -683,11 +796,14 @@ def download_all(ctx, address: str | None, session_key: str | None,
 @click.option("--key", "session_key", default=None, help="Session key.")
 @click.option("--skip-process", is_flag=True, help="Only download, skip transcription and summary.")
 @click.option("--prompt", default=None, help="Custom summary prompt (use {transcript} placeholder).")
+@click.option("--delete-after", is_flag=True,
+              help="Afterwards, delete every recording with a complete local copy from the device.")
 @click.pass_context
 def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
          whisper_model: str | None, style: str | None,
          anthropic_key: str | None, hf_token: str | None,
-         session_key: str | None, skip_process: bool, prompt: str | None):
+         session_key: str | None, skip_process: bool, prompt: str | None,
+         delete_after: bool):
     """Sync all new recordings: download, transcribe, summarize.
 
     \b
@@ -826,6 +942,8 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
         console.print(f"[dim]Output: {out_root}[/dim]")
 
     asyncio.run(_run())
+    if delete_after:
+        _delete_downloaded(address, session_key, out_root, since, assume_yes=True)
 
 
 @cli.command()

@@ -166,6 +166,20 @@ verified on hardware with `pocket-libre usb on`: the device's storage shows
 up as a USB drive. `GET&USB` is the only `GET&` command seen so far; others
 may exist.
 
+### Deleting a Recording
+
+```
+>> APP&D&2026-10-03&20261003081846
+<< MCU&D
+```
+
+Deletes one recording; the others on the device stay put. Confirmed on
+firmware 1.8 (2026-10-04) by listing before and after. The reply carries no
+status, so check the deletion by listing the date again. The command was
+guessed from the vendor app's command names and the `LIST` format, not
+captured from the vendor app; what it answers for a recording that doesn't
+exist is untested.
+
 ### BLE File Transfer
 
 ```

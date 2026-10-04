@@ -52,6 +52,16 @@ confirmed it on 1.7.
   (e.g. `PH261002211958`), seen alongside the usual `YYYYMMDDHHmmss` names.
   They already worked; a test now keeps the listing parser from dropping them.
 
+- **`delete` removes recordings from the device** with `APP&D&<date>&<timestamp>`.
+  It deletes one recording (`--date`/`--timestamp`), or with `--downloaded` every
+  recording that has a complete copy in the output directory. It asks first
+  unless you pass `--yes`. `sync` and `download-all` take `--delete-after` to do
+  the same once they finish. A copy counts as complete if it exists and is at
+  least 95% of the size the listed duration predicts. Recordings without one are
+  kept. Each deletion is confirmed by listing the date again, because the
+  device's `MCU&D` reply carries no status. Also `PocketCommander.delete()` and
+  `commands.has_complete_copy()`.
+
 ### Changed
 
 - **WiFi status codes were mislabelled.** `MCU&WIFIS&3` is "AP coming up" and

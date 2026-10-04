@@ -85,6 +85,21 @@ class Recording:
         )
 
 
+def has_complete_copy(recording: Recording, path) -> bool:
+    """True if `path` holds a complete download of `recording`.
+
+    Downloads are only ever written whole (both transfer paths check the size
+    the device announces), so the file existing is the main evidence. The
+    size check against the listed duration guards against a file put there
+    by something else; real files come out within 1% above the estimate.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    return size > 0 and size >= recording.estimated_bytes * 0.95
+
+
 class PocketCommander:
     """Send commands to a Pocket device and collect responses."""
 
@@ -381,6 +396,18 @@ class PocketCommander:
             if len(dirs) > 1:
                 await asyncio.sleep(0.2)
         return sorted(all_recs, key=lambda r: r.sort_key)
+
+    # ── Deleting ─────────────────────────────────
+
+    async def delete(self, recording: Recording) -> bool:
+        """Delete a recording from the device. True once it is gone from the listing.
+
+        APP&D&<date>&<timestamp> is answered by a bare MCU&D that carries no
+        status, so success is checked by listing the date again.
+        """
+        await self._send(f"D&{recording.date}&{recording.timestamp}")
+        remaining = await self.list_files(recording.date)
+        return all(r.timestamp != recording.timestamp for r in remaining)
 
     # ── BLE File Transfer ────────────────────────
 
