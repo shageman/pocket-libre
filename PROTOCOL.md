@@ -123,7 +123,17 @@ Format: `MCU&F&<date>&<timestamp>&<duration_seconds>`
 > This was mislabelled here until firmware 1.8 field data corrected it
 > ([#4](https://github.com/shahcolate/pocket-libre/issues/4)). Multiply by
 > 4000 B/s (32 kbps) to estimate the size on disk.
+
 Ends with: `MCU&LIST&<count>` (zero-padded)
+
+**Recording names.** The timestamp is usually `YYYYMMDDHHmmss`, the time the
+recording started. A second form, `PH` + `YYMMDDHHmmss`, also occurs:
+`PH261002211958` (2026-10-02 21:19:58) was seen next to ordinary names on
+firmware 1.7 ([#11](https://github.com/shahcolate/pocket-libre/issues/11)),
+and the form has also turned up on 1.8. It lists and downloads like any other
+recording. What makes the device use it is unknown; a recording mode such as
+a phone call is one guess. Treat the timestamp as an opaque name, not
+something to parse as a date.
 
 ### USB Mass Storage
 

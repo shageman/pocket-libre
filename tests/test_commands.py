@@ -122,6 +122,23 @@ async def test_list_files_parses_valid_rows(cmd, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_files_keeps_ph_prefixed_names(cmd, monkeypatch):
+    """Some recordings are named PH + YYMMDDHHmmss (issue #11, #18); they
+    must not be dropped by a parser that expects a 14-digit timestamp."""
+    monkeypatch.setattr(
+        cmd, "_send",
+        _FakeSend([
+            "MCU&F&2026-10-02&20261002201252&3014",
+            "MCU&F&2026-10-02&PH261002211958&346",
+        ]),
+    )
+    recs = await cmd.list_files("2026-10-02")
+    assert [r.timestamp for r in recs] == ["20261002201252", "PH261002211958"]
+    assert recs[1].filename == "PH261002211958.mp3"
+    assert recs[1].duration_s == 346
+
+
+@pytest.mark.asyncio
 async def test_list_files_drops_traversal_names(cmd, monkeypatch):
     """A malicious or malfunctioning device must not steer writes out of
     the output directory."""
