@@ -48,6 +48,9 @@ confirmed it on 1.7.
 - **USB mass storage control.** `pocket-libre usb on|off|status` switches the
   device's USB drive mode over BLE (`APP&USB&<0|1>`, read back with
   `APP&GET&USB`), decoded from an HCI snoop capture of the vendor app.
+- PROTOCOL.md documents recording names of the form `PH` + `YYMMDDHHmmss`
+  (e.g. `PH261002211958`), seen alongside the usual `YYYYMMDDHHmmss` names.
+  They already worked; a test now keeps the listing parser from dropping them.
 
 ### Changed
 
