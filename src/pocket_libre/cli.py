@@ -6,6 +6,7 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 
 from pocket_libre.capture import capture_audio
@@ -249,7 +250,8 @@ def show_config(ctx, show_path: bool, set_value: str | None):
     for section, values in config.items():
         if not isinstance(values, dict):
             continue
-        console.print(f"\n[bold cyan][{section}][/bold cyan]")
+        header = f"[{section}]"
+        console.print(f"\n[bold cyan]{escape(header)}[/bold cyan]")
         for key, val in values.items():
             display = val
             if key in ("anthropic_key", "hf_token", "session_key") and val and len(str(val)) > 8:
