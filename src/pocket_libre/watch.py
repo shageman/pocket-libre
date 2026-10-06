@@ -113,7 +113,7 @@ async def sync_new_recordings(
     hf_token: str | None = None,
 ) -> int:
     """Download every recording not already on disk. Returns the count."""
-    from pocket_libre.commands import PocketCommander, download_with_retry
+    from pocket_libre.commands import PocketCommander, download_with_retry, record_download
     from pocket_libre.protocol import MP3_SYNC_WORD
 
     async with PocketCommander(address) as cmd:
@@ -143,6 +143,7 @@ async def sync_new_recordings(
         if start > 0:
             data = data[start:]
         audio_path.write_bytes(data)
+        record_download(audio_path, len(data))
         synced += 1
 
         if process:

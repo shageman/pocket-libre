@@ -1,21 +1,53 @@
-"""Deleting recordings: only ever what has a complete copy on disk."""
+"""Deleting recordings: only ever what has a verified copy on disk."""
+
+import json
 
 import pytest
 from click.testing import CliRunner
 
 from pocket_libre import cli, commands
-from pocket_libre.commands import PocketCommander, Recording, has_complete_copy
+from pocket_libre.commands import (
+    DOWNLOADS_FILE,
+    PocketCommander,
+    Recording,
+    has_complete_copy,
+    record_download,
+    save_recording,
+)
 
-DONE = Recording("2026-10-03", "20261003081846", 97)     # complete copy on disk
-SHORT = Recording("2026-10-03", "20261003090502", 3684)  # copy cut short
+DONE = Recording("2026-10-03", "20261003081846", 97)     # verified copy on disk
+SHORT = Recording("2026-10-03", "20261003090502", 3684)  # copy cut short since
+OLD = Recording("2026-10-03", "20261003101010", 60)      # copy from before sizes were recorded
 NEW = Recording("2026-10-03", "20261003192133", 5196)    # never downloaded
 
 
-def _write(root, rec, size):
+def _write(root, rec, size, recorded=None):
+    """A copy of `rec` of `size` bytes; `recorded` is the size its download noted."""
     path = root / rec.date / rec.filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"\xff" * size)
+    if recorded is not None:
+        record_download(path, recorded)
     return path
+
+
+def _listing(*recs, count=None):
+    """A LIST answer as the device sends it, ending with MCU&LIST&<count>."""
+    lines = [f"MCU&F&{r.date}&{r.timestamp}&{r.duration_s}" for r in recs]
+    return [*lines, f"MCU&LIST&{len(recs) if count is None else count:03d}"]
+
+
+def _commander(answers):
+    """A commander whose _send answers from `answers`, a function of the command."""
+    cmd = PocketCommander("AA:BB:CC:DD:EE:FF")
+    sent = []
+
+    async def send(command, verbose=False):
+        sent.append(command)
+        return answers(command)
+
+    cmd._send = send
+    return cmd, sent
 
 
 # ── PocketCommander.delete ──────────────────────
@@ -23,54 +55,83 @@ def _write(root, rec, size):
 
 @pytest.mark.asyncio
 async def test_delete_sends_command_and_checks_listing():
-    cmd = PocketCommander("AA:BB:CC:DD:EE:FF")
-    sent = []
-    listing = [DONE, NEW]
+    cmd, sent = _commander(lambda c: ["MCU&D"] if c.startswith("D&") else _listing(NEW))
+    assert await cmd.delete(DONE) is True
+    assert sent == ["D&2026-10-03&20261003081846", "LIST&2026-10-03"]
 
-    async def send(command, verbose=False):
-        sent.append(command)
-        listing.remove(DONE)
-        return ["MCU&D"]
 
-    async def list_files(date):
-        return list(listing)
-
-    cmd._send, cmd.list_files = send, list_files
-    assert await cmd.delete(DONE)
-    assert sent == ["D&2026-10-03&20261003081846"]
+@pytest.mark.asyncio
+async def test_delete_of_the_last_recording_of_a_date():
+    cmd, _ = _commander(lambda c: ["MCU&D"] if c.startswith("D&") else _listing())
+    assert await cmd.delete(DONE) is True
 
 
 @pytest.mark.asyncio
 async def test_delete_reports_a_recording_that_stayed():
-    cmd = PocketCommander("AA:BB:CC:DD:EE:FF")
+    cmd, _ = _commander(lambda c: ["MCU&D"] if c.startswith("D&") else _listing(DONE))
+    assert await cmd.delete(DONE) is False
 
-    async def send(command, verbose=False):
-        return ["MCU&D"]
 
-    async def list_files(date):
-        return [DONE]
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [
+    [],                                       # no answer in time
+    _listing(NEW)[:-1],                       # cut short: no MCU&LIST&<count>
+    _listing(NEW, count=2),                   # an entry missing
+])
+async def test_delete_without_a_complete_listing_is_unconfirmed(answer):
+    cmd, sent = _commander(lambda c: ["MCU&D"] if c.startswith("D&") else answer)
+    assert await cmd.delete(DONE) is None
+    assert sent.count("LIST&2026-10-03") == 2  # listed again before giving up
 
-    cmd._send, cmd.list_files = send, list_files
-    assert not await cmd.delete(DONE)
+
+@pytest.mark.asyncio
+async def test_a_late_listing_is_asked_for_again():
+    answers = iter([_listing(NEW)[:-1], _listing(NEW)])
+    cmd, _ = _commander(lambda c: ["MCU&D"] if c.startswith("D&") else next(answers))
+    assert await cmd.delete(DONE) is True
 
 
 # ── has_complete_copy ───────────────────────────
 
 
-def test_complete_copy(tmp_path):
-    assert has_complete_copy(DONE, _write(tmp_path, DONE, 389_408))
+def test_copy_with_its_recorded_size(tmp_path):
+    assert has_complete_copy(_write(tmp_path, DONE, 389_408, recorded=389_408))
 
 
-def test_missing_copy(tmp_path):
-    assert not has_complete_copy(DONE, tmp_path / DONE.date / DONE.filename)
+def test_copy_one_byte_short_of_its_record(tmp_path):
+    assert not has_complete_copy(_write(tmp_path, SHORT, 389_407, recorded=389_408))
+
+
+def test_copy_without_a_record_never_counts(tmp_path):
+    """Truncated files from older versions, whatever their size."""
+    assert not has_complete_copy(_write(tmp_path, OLD, 10_000_000))
+
+
+def test_recorded_copy_that_is_gone(tmp_path):
+    path = _write(tmp_path, DONE, 389_408, recorded=389_408)
+    path.unlink()
+    assert not has_complete_copy(path)
 
 
 def test_empty_copy(tmp_path):
-    assert not has_complete_copy(Recording("d", "t", 0), _write(tmp_path, DONE, 0))
+    assert not has_complete_copy(_write(tmp_path, DONE, 0, recorded=0))
 
 
-def test_short_copy(tmp_path):
-    assert not has_complete_copy(SHORT, _write(tmp_path, SHORT, 1_000_000))
+def test_unreadable_record(tmp_path):
+    path = _write(tmp_path, DONE, 100)
+    (path.parent / DOWNLOADS_FILE).write_text("{not json")
+    assert not has_complete_copy(path)
+
+
+def test_save_recording_records_the_size_and_keeps_other_records(tmp_path):
+    (tmp_path / DONE.date).mkdir()
+    first = tmp_path / DONE.date / DONE.filename
+    second = tmp_path / DONE.date / NEW.filename
+    save_recording(first, b"\xff" * 10)
+    save_recording(second, b"\xff" * 20)
+    book = json.loads((tmp_path / DONE.date / DOWNLOADS_FILE).read_text())
+    assert book == {DONE.filename: 10, NEW.filename: 20}
+    assert has_complete_copy(first) and has_complete_copy(second)
 
 
 # ── CLI ─────────────────────────────────────────
@@ -81,6 +142,7 @@ class _Device:
 
     recordings: list = []
     deleted: list = []
+    confirms = True
 
     def __init__(self, address):
         pass
@@ -100,22 +162,27 @@ class _Device:
     async def list_files(self, date):
         return [r for r in _Device.recordings if r.date == date]
 
+    async def list_files_complete(self, date):
+        return await self.list_files(date)
+
     async def delete(self, rec):
         # The device goes by date and timestamp; `delete --date` has no duration.
         match = next(r for r in _Device.recordings if r.timestamp == rec.timestamp)
         _Device.recordings.remove(match)
         _Device.deleted.append(match)
-        return True
+        return True if _Device.confirms else None
 
 
 @pytest.fixture
 def device(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "PocketCommander", _Device)
     monkeypatch.setattr(cli, "load_config", lambda: {})
-    _Device.recordings = [DONE, SHORT, NEW]
+    _Device.recordings = [DONE, SHORT, OLD, NEW]
     _Device.deleted = []
-    _write(tmp_path, DONE, 389_408)
-    _write(tmp_path, SHORT, 1_000_000)
+    _Device.confirms = True
+    _write(tmp_path, DONE, 389_408, recorded=389_408)
+    _write(tmp_path, SHORT, 1_000_000, recorded=14_736_000)
+    _write(tmp_path, OLD, 240_000)
     return _Device
 
 
@@ -124,17 +191,25 @@ def _run(*args, input=None):
                               input=input)
 
 
-def test_delete_downloaded_keeps_incomplete_and_missing(device, tmp_path):
+def test_delete_downloaded_keeps_everything_without_a_matching_record(device, tmp_path):
     result = _run("delete", "--downloaded", "--yes", "--output-dir", str(tmp_path))
     assert result.exit_code == 0, result.output
     assert device.deleted == [DONE]
-    assert device.recordings == [SHORT, NEW]
+    assert device.recordings == [SHORT, OLD, NEW]
 
 
 def test_delete_downloaded_asks_first(device, tmp_path):
     result = _run("delete", "--downloaded", "--output-dir", str(tmp_path), input="n\n")
     assert result.exit_code != 0
     assert device.deleted == []
+
+
+def test_unconfirmed_delete_is_reported_and_fails_the_run(device, tmp_path):
+    device.confirms = False
+    result = _run("delete", "--downloaded", "--yes", "--output-dir", str(tmp_path))
+    assert result.exit_code == 1
+    assert "Could not confirm" in result.output
+    assert "0 of 1 recording(s) deleted" in result.output
 
 
 def test_delete_one(device):
@@ -168,5 +243,12 @@ def test_download_all_delete_after(device, tmp_path, monkeypatch):
     monkeypatch.setattr(commands, "download_with_retry", download)
     result = _run("download-all", "--output-dir", str(tmp_path), "--delete-after")
     assert result.exit_code == 0, result.output
-    assert device.deleted == [DONE, NEW]
-    assert device.recordings == [SHORT]
+    assert device.deleted == [DONE, NEW]  # NEW was downloaded, so its size was recorded
+    assert device.recordings == [SHORT, OLD]
+
+
+def test_wifi_transfer_delete_after_is_for_a_batch(device):
+    result = _run("wifi-transfer", "--date", NEW.date, "--timestamp", NEW.timestamp,
+                  "--delete-after")
+    assert result.exit_code == 2
+    assert device.deleted == []

@@ -12,10 +12,12 @@ Usage:
 """
 
 import asyncio
+import json
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from bleak import BleakClient
 from bleak.exc import BleakError
@@ -85,19 +87,58 @@ class Recording:
         )
 
 
-def has_complete_copy(recording: Recording, path) -> bool:
-    """True if `path` holds a complete download of `recording`.
+# Next to the recordings of each date: the size of every file a verified
+# download wrote there, {"<timestamp>.mp3": <bytes>}.
+DOWNLOADS_FILE = ".downloads.json"
 
-    Downloads are only ever written whole (both transfer paths check the size
-    the device announces), so the file existing is the main evidence. The
-    size check against the listed duration guards against a file put there
-    by something else; real files come out within 1% above the estimate.
-    """
+
+def _downloads(directory: Path) -> dict[str, int]:
     try:
-        size = path.stat().st_size
+        entries = json.loads((directory / DOWNLOADS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return entries if isinstance(entries, dict) else {}
+
+
+def record_download(path, size: int) -> None:
+    """Note that a verified download wrote `size` bytes to `path`.
+
+    Only a download that checked the size the device announces may call
+    this; has_complete_copy() relies on it before deleting from the device.
+    """
+    path = Path(path)
+    entries = _downloads(path.parent)
+    entries[path.name] = size
+    book = path.parent / DOWNLOADS_FILE
+    tmp = book.with_name(book.name + ".tmp")
+    tmp.write_text(json.dumps(entries, indent=1, sort_keys=True) + "\n")
+    tmp.replace(book)
+
+
+def save_recording(path, data: bytes) -> None:
+    """Write a verified download to `path` and record its size."""
+    path = Path(path)
+    path.write_bytes(data)
+    record_download(path, len(data))
+
+
+def has_complete_copy(path) -> bool:
+    """True if `path` has exactly the size a verified download recorded for it.
+
+    A file without a record (one downloaded before sizes were recorded, which
+    older versions may have saved cut short, or one put there by something
+    else) never counts, whatever its size, and neither does a file whose size changed
+    since. Deleting from the device can't be undone, so this errs towards
+    keeping recordings.
+    """
+    path = Path(path)
+    recorded = _downloads(path.parent).get(path.name)
+    if not isinstance(recorded, int) or recorded <= 0:
+        return False
+    try:
+        return path.stat().st_size == recorded
     except OSError:
         return False
-    return size > 0 and size >= recording.estimated_bytes * 0.95
 
 
 class PocketCommander:
@@ -360,11 +401,36 @@ class PocketCommander:
 
     async def list_files(self, date: str) -> list[Recording]:
         """List recordings for a date. Returns list of Recording objects."""
-        responses = await self._send(f"LIST&{date}")
+        recordings, _ = self._parse_listing(await self._send(f"LIST&{date}"))
+        return recordings
+
+    async def list_files_complete(self, date: str, tries: int = 2) -> list[Recording] | None:
+        """List recordings for a date, or None if no complete listing arrived.
+
+        A listing is complete when it ends with MCU&LIST&<count> and the count
+        matches the MCU&F entries. Without that, an empty or short answer
+        can't be told from a reply that came too late for _send.
+        """
+        for _ in range(tries):
+            recordings, complete = self._parse_listing(await self._send(f"LIST&{date}"))
+            if complete:
+                return recordings
+        return None
+
+    @staticmethod
+    def _parse_listing(responses: list[str]) -> tuple[list[Recording], bool]:
+        """The recordings in a LIST answer, and whether the answer was complete."""
         recordings = []
+        entries = 0
+        count = None
         for r in responses:
+            if r.startswith(f"{RSP_PREFIX}LIST&"):
+                value = r[len(f"{RSP_PREFIX}LIST&"):].strip()
+                count = int(value) if value.isdigit() else None
+                continue
             if not r.startswith(f"{RSP_PREFIX}F&"):
                 continue
+            entries += 1
             # MCU&F&2026-03-28&20260328001919&6222
             # The trailing field is a duration in seconds (see protocol.py).
             parts = r.split("&")
@@ -379,7 +445,7 @@ class PocketCommander:
                     continue
                 duration_s = int(parts[4]) if parts[4].isdigit() else 0
                 recordings.append(Recording(rec_date, timestamp, duration_s))
-        return recordings
+        return recordings, count == entries
 
     async def list_all_recordings(self) -> list[Recording]:
         """List all recordings across all dates, oldest first.
@@ -399,14 +465,18 @@ class PocketCommander:
 
     # ── Deleting ─────────────────────────────────
 
-    async def delete(self, recording: Recording) -> bool:
-        """Delete a recording from the device. True once it is gone from the listing.
+    async def delete(self, recording: Recording) -> bool | None:
+        """Delete a recording from the device.
 
+        True once it is gone from a complete listing of its date, False if it
+        is still listed, None if no complete listing came back to tell.
         APP&D&<date>&<timestamp> is answered by a bare MCU&D that carries no
-        status, so success is checked by listing the date again.
+        status, so the listing is the only confirmation.
         """
         await self._send(f"D&{recording.date}&{recording.timestamp}")
-        remaining = await self.list_files(recording.date)
+        remaining = await self.list_files_complete(recording.date)
+        if remaining is None:
+            return None
         return all(r.timestamp != recording.timestamp for r in remaining)
 
     # ── BLE File Transfer ────────────────────────

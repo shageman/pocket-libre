@@ -54,13 +54,19 @@ confirmed it on 1.7.
 
 - **`delete` removes recordings from the device** with `APP&D&<date>&<timestamp>`.
   It deletes one recording (`--date`/`--timestamp`), or with `--downloaded` every
-  recording that has a complete copy in the output directory. It asks first
-  unless you pass `--yes`. `sync` and `download-all` take `--delete-after` to do
-  the same once they finish. A copy counts as complete if it exists and is at
-  least 95% of the size the listed duration predicts. Recordings without one are
-  kept. Each deletion is confirmed by listing the date again, because the
-  device's `MCU&D` reply carries no status. Also `PocketCommander.delete()` and
-  `commands.has_complete_copy()`.
+  recording that has a verified copy in the output directory. It asks first
+  unless you pass `--yes`. `sync`, `download-all` and `wifi-transfer` take
+  `--delete-after` to do the same once they finish. A copy counts as verified
+  only if its size matches, to the byte, the size its download recorded in
+  `<date>/.downloads.json`; downloads record it once they have checked the size
+  the device announced. Copies without a record, such as ones downloaded by
+  earlier versions, are always kept, as are downloads from the web UI. Each
+  deletion is confirmed by a complete listing of the date (one that ends in
+  `MCU&LIST&<count>` with that many entries), because the device's `MCU&D`
+  reply carries no status; without one, the deletion is reported as
+  unconfirmed. Also `PocketCommander.delete()`,
+  `PocketCommander.list_files_complete()`, `commands.has_complete_copy()` and
+  `commands.save_recording()`.
 
 ### Changed
 

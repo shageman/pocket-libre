@@ -510,7 +510,7 @@ def download(ctx, address: str | None, session_key: str | None,
     config = ctx.obj["config"]
     address = _require_address(address, config)
     session_key = _require_session_key(session_key, config)
-    from pocket_libre.commands import download_with_retry
+    from pocket_libre.commands import download_with_retry, save_recording
 
     async def _run():
         rec = Recording(date=date, timestamp=timestamp, duration_s=0)
@@ -529,7 +529,7 @@ def download(ctx, address: str | None, session_key: str | None,
             return
 
         out_path = Path(output) if output else Path(f"{timestamp}.mp3")
-        out_path.write_bytes(data)
+        save_recording(out_path, data)
         console.print(f"[bold green]Saved {len(data):,} bytes to {out_path}[/bold green]")
 
     asyncio.run(_run())
@@ -572,7 +572,7 @@ def _plan_downloads(jobs: list[tuple[Recording, Path]], listed: int,
 @click.option("--process", "do_process", is_flag=True, help="Transcribe and summarize after download.")
 @click.option("--output-dir", default=None, help="Output directory.")
 @click.option("--delete-after", is_flag=True,
-              help="Afterwards, delete every recording with a complete local copy from the device.")
+              help="Afterwards, delete every recording with a verified local copy from the device.")
 @click.pass_context
 def download_all(ctx, address: str | None, session_key: str | None,
                  since: str | None, do_process: bool, output_dir: str | None,
@@ -587,7 +587,7 @@ def download_all(ctx, address: str | None, session_key: str | None,
     address = _require_address(address, config)
     session_key = _require_session_key(session_key, config)
     out_root = Path(get_output_dir(config, output_dir))
-    from pocket_libre.commands import download_with_retry
+    from pocket_libre.commands import download_with_retry, record_download
 
     async def _run():
         async with PocketCommander(address) as cmd:
@@ -635,6 +635,7 @@ def download_all(ctx, address: str | None, session_key: str | None,
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 partial.write_bytes(data)
                 partial.replace(out_path)
+                record_download(out_path, len(data))
             except OSError as e:
                 failed += 1
                 try:
@@ -679,22 +680,31 @@ async def _delete_recordings(address: str, session_key: str,
         if not await cmd.authenticate(session_key):
             raise click.ClickException("Authentication failed.")
         for rec in recs:
+            name = f"{rec.date}/{rec.timestamp}"
             # delete() checks the listing afterwards, which can't tell a
             # deletion from a recording that was never there.
-            if all(r.timestamp != rec.timestamp for r in await cmd.list_files(rec.date)):
-                console.print(f"  [red]{rec.date}/{rec.timestamp} is not on the device.[/red]")
+            listed = await cmd.list_files_complete(rec.date)
+            if listed is None:
+                console.print(f"  [red]Could not list {rec.date}; kept {name}.[/red]")
                 continue
-            if await cmd.delete(rec):
+            if all(r.timestamp != rec.timestamp for r in listed):
+                console.print(f"  [red]{name} is not on the device.[/red]")
+                continue
+            gone = await cmd.delete(rec)
+            if gone:
                 deleted += 1
-                console.print(f"  [green]Deleted {rec.date}/{rec.timestamp}[/green]")
+                console.print(f"  [green]Deleted {name}[/green]")
+            elif gone is None:
+                console.print(f"  [yellow]Could not confirm that {name} was deleted; "
+                              "check with `pocket-libre list`.[/yellow]")
             else:
-                console.print(f"  [red]{rec.date}/{rec.timestamp} is still on the device.[/red]")
+                console.print(f"  [red]{name} is still on the device.[/red]")
     return deleted
 
 
 def _delete_downloaded(address: str, session_key: str, out_root: Path,
                        since: str | None, assume_yes: bool) -> None:
-    """Delete from the device every recording with a complete copy under out_root."""
+    """Delete from the device every recording with a verified copy under out_root."""
     from pocket_libre.commands import has_complete_copy
 
     async def _list() -> list[Recording]:
@@ -707,10 +717,11 @@ def _delete_downloaded(address: str, session_key: str, out_root: Path,
     recs = asyncio.run(_list())
     if since:
         recs = [r for r in recs if r.date >= since]
-    done = [r for r in recs if has_complete_copy(r, out_root / r.date / r.filename)]
+    done = [r for r in recs if has_complete_copy(out_root / r.date / r.filename)]
     for r in recs:
         if r not in done:
-            console.print(f"  [yellow]Keeping {r} (no complete copy in {out_root})[/yellow]")
+            console.print(f"  [yellow]Keeping {r} (no copy in {out_root} with the size "
+                          "its download recorded)[/yellow]")
     if not done:
         console.print("[dim]Nothing to delete.[/dim]")
         return
@@ -731,7 +742,8 @@ def _delete_downloaded(address: str, session_key: str, out_root: Path,
 @click.option("--date", default=None, help="Recording date (YYYY-MM-DD), with --timestamp.")
 @click.option("--timestamp", default=None, help="Recording timestamp, with --date.")
 @click.option("--downloaded", is_flag=True,
-              help="Delete every recording that has a complete copy in the output directory.")
+              help="Delete every recording that has a verified copy in the output directory "
+                   "(one whose size matches what its download recorded).")
 @click.option("--output-dir", default=None,
               help="With --downloaded: where the copies are (default: the configured one).")
 @click.option("--since", default=None,
@@ -797,7 +809,7 @@ def delete(ctx, address: str | None, session_key: str | None, date: str | None,
 @click.option("--skip-process", is_flag=True, help="Only download, skip transcription and summary.")
 @click.option("--prompt", default=None, help="Custom summary prompt (use {transcript} placeholder).")
 @click.option("--delete-after", is_flag=True,
-              help="Afterwards, delete every recording with a complete local copy from the device.")
+              help="Afterwards, delete every recording with a verified local copy from the device.")
 @click.pass_context
 def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
          whisper_model: str | None, style: str | None,
@@ -811,7 +823,7 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
     transcribes with Whisper (locally) and summarizes with Claude Haiku
     (~$0.001 per recording). Skips recordings already on disk.
     """
-    from pocket_libre.commands import download_with_retry
+    from pocket_libre.commands import download_with_retry, save_recording
 
     config = ctx.obj["config"]
     address = _require_address(address, config)
@@ -883,7 +895,7 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
                 console.print("  [red]Failed to download.[/red]")
                 continue
 
-            audio_path.write_bytes(data)
+            save_recording(audio_path, data)
             console.print(f"  [green]Saved {len(data):,} bytes[/green]")
 
             if skip_process:
@@ -1212,11 +1224,13 @@ def wifi_discover(host: str | None, start_port: int, end_port: int, force: bool)
                    "(Windows), or manual (you join it yourself). Default: by OS.")
 @click.option("--iface", default=None, help="WiFi interface to use (default: the first one).")
 @click.option("--force", is_flag=True, help="Run on firmware other than 1.7 or 1.8.")
+@click.option("--delete-after", is_flag=True,
+              help="Afterwards, delete every recording with a verified local copy from the device.")
 @click.pass_context
 def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str | None,
                   timestamp: str | None, since: str | None, output: str | None,
                   output_dir: str | None, overwrite: bool, wifi_backend: str,
-                  iface: str | None, force: bool):
+                  iface: str | None, force: bool, delete_after: bool):
     """Download recordings over WiFi instead of BLE (firmware 1.7 and 1.8).
 
     \b
@@ -1238,7 +1252,7 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
     """
     from bleak.exc import BleakError
 
-    from pocket_libre.commands import is_safe_id
+    from pocket_libre.commands import is_safe_id, record_download
     from pocket_libre.hostwifi import HostWifiError, backend
     from pocket_libre.protocol import FILES_PER_AP_SESSION
     from pocket_libre.wifi import (
@@ -1254,6 +1268,8 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
         raise click.UsageError("Pass --date and --timestamp together, or neither.")
     if output and date is None:
         raise click.UsageError("--output is for a single recording; use --output-dir.")
+    if delete_after and date is not None:
+        raise click.UsageError("--delete-after is for a batch; use `delete` for one recording.")
     if date is not None and not (is_safe_id(date) and is_safe_id(timestamp)):
         raise click.UsageError("--date and --timestamp must be plain identifiers.")
 
@@ -1352,6 +1368,7 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
                                                   "not attempted.[/yellow]")
                                 break
                             continue
+                        record_download(result.path, result.size)
                         rate = result.size / result.seconds / 1024 if result.seconds else 0
                         console.print(
                             f"\n    [green]Saved {result.size:,} bytes to {result.path} "
@@ -1379,6 +1396,8 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
 
     if done or failed:
         console.print(f"\n[bold]{done} downloaded, {failed} failed.[/bold]")
+    if delete_after:
+        _delete_downloaded(address, session_key, out_root, since, assume_yes=True)
     if failed:
         raise SystemExit(1)
 

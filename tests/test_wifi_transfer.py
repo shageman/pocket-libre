@@ -774,3 +774,17 @@ def test_windows_profile_is_hidden_and_escaped():
     xml = windows_profile("A&B", "p<w>")
     assert "<name>A&amp;B</name>" in xml and "p&lt;w&gt;" in xml
     assert "<nonBroadcast>true</nonBroadcast>" in xml
+
+
+def test_wifi_transfer_records_the_size_of_each_download(monkeypatch, tmp_path):
+    """delete --downloaded only trusts a copy whose size its download recorded."""
+    import json
+
+    from pocket_libre.commands import DOWNLOADS_FILE, has_complete_copy
+
+    result = run_wifi_transfer(monkeypatch, tmp_path)
+    assert result.exit_code == 0, result.output
+    copies = list(tmp_path.glob("*/*.mp3"))
+    assert copies and all(has_complete_copy(p) for p in copies)
+    book = json.loads((copies[0].parent / DOWNLOADS_FILE).read_text())
+    assert set(book) == {p.name for p in copies if p.parent == copies[0].parent}
