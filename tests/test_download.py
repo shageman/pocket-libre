@@ -151,5 +151,60 @@ def test_download_all_never_writes_a_failed_download(tmp_path, monkeypatch):
         "--output-dir", str(tmp_path),
     ])
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
+    assert "0 downloaded, 1 failed" in result.output
     assert not (tmp_path / REC.date / REC.filename).exists()
+
+
+EARLY = Recording("2026-10-02", "20261002110000", 0)
+LATE = Recording("2026-10-03", "20261003160000", 0)
+
+
+def _run_download_all(tmp_path, monkeypatch, recs):
+    """download-all over `recs` (listed in that order); returns the result and
+    the recordings it downloaded, in order."""
+    from pocket_libre import cli
+
+    fetched = []
+
+    class _Lister(_FakeCommander):
+        async def list_all_recordings(self):
+            return list(recs)
+
+    async def download(address, key, rec, progress_callback=None):
+        fetched.append(rec)
+        return FULL
+
+    monkeypatch.setattr(cli, "PocketCommander", _Lister)
+    monkeypatch.setattr(commands, "download_with_retry", download)
+    monkeypatch.setattr(cli, "load_config", lambda: {})
+    result = CliRunner().invoke(cli.cli, [
+        "download-all", "--address", "addr", "--key", "k" * 16,
+        "--output-dir", str(tmp_path),
+    ])
+    return result, fetched
+
+
+def test_download_all_counts_only_what_it_downloaded(tmp_path, monkeypatch):
+    (tmp_path / REC.date).mkdir()
+    (tmp_path / REC.date / REC.filename).write_bytes(FULL)
+
+    result, fetched = _run_download_all(tmp_path, monkeypatch, [LATE, REC, EARLY])
+
+    assert result.exit_code == 0, result.output
+    assert fetched == [EARLY, LATE]  # date order, the existing copy left alone
+    assert "2 recording(s) to download (1 already downloaded)" in result.output
+    assert "2 downloaded, 0 failed" in result.output
+    assert "skipping" not in result.output
+
+
+def test_download_all_says_once_when_everything_is_downloaded(tmp_path, monkeypatch):
+    for rec in (EARLY, LATE):
+        (tmp_path / rec.date).mkdir()
+        (tmp_path / rec.date / rec.filename).write_bytes(FULL)
+
+    result, fetched = _run_download_all(tmp_path, monkeypatch, [LATE, EARLY])
+
+    assert result.exit_code == 0, result.output
+    assert fetched == []
+    assert "2 recording(s) on the device, all already downloaded." in result.output

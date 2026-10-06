@@ -505,7 +505,7 @@ class StubCommander:
 
 
 def run_wifi_transfer(monkeypatch, tmp_path, second_download_fails=None,
-                      firmware="1.8.0", args=(), sessions=None):
+                      firmware="1.8.0", args=(), sessions=None, fetched=None):
     """Run the command over three recordings; the second download fails."""
     from click.testing import CliRunner
 
@@ -526,6 +526,8 @@ def run_wifi_transfer(monkeypatch, tmp_path, second_download_fails=None,
 
         async def download(self, rec, path, progress_callback=None):
             self.calls += 1
+            if fetched is not None:
+                fetched.append(rec.timestamp)
             if self.calls == 2 and second_download_fails:
                 second_download_fails(self.cmd)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -591,6 +593,32 @@ def test_files_per_session_follows_the_firmware(monkeypatch, tmp_path, firmware,
     result = run_wifi_transfer(monkeypatch, tmp_path, firmware=firmware, sessions=sessions)
     assert result.exit_code == 0, result.output
     assert sessions == [per_session]
+
+
+def test_recordings_go_in_date_order(monkeypatch, tmp_path):
+    fetched = []
+    result = run_wifi_transfer(monkeypatch, tmp_path, fetched=fetched)
+    assert result.exit_code == 0, result.output
+    assert fetched == sorted(FILES)  # listed out of order by the device
+
+
+def test_already_downloaded_recordings_are_counted_in_one_line(monkeypatch, tmp_path):
+    first = sorted(FILES)[0]
+    (tmp_path / "2026-10-03").mkdir()
+    (tmp_path / "2026-10-03" / f"{first}.mp3").write_bytes(b"mp3")
+    result = run_wifi_transfer(monkeypatch, tmp_path)
+    assert result.exit_code == 0, result.output
+    assert "2 recording(s) to download over WiFi (1 already downloaded)." in result.output
+    assert "skipping" not in result.output
+
+
+def test_everything_downloaded_says_so_once(monkeypatch, tmp_path):
+    (tmp_path / "2026-10-03").mkdir()
+    for ts in FILES:
+        (tmp_path / "2026-10-03" / f"{ts}.mp3").write_bytes(b"mp3")
+    result = run_wifi_transfer(monkeypatch, tmp_path)
+    assert result.exit_code == 0, result.output
+    assert "3 recording(s) on the device, all already downloaded." in result.output
 
 
 def test_untested_firmware_needs_force_and_gets_one_file_per_session(monkeypatch, tmp_path):

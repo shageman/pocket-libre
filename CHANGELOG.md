@@ -85,6 +85,13 @@ confirmed it on 1.7.
   repeating it for every remaining file. In a 12-file field run, these two
   accounted for all 4 failed files.
 
+- **`download-all` counted skipped recordings as downloaded** and exited 0 when
+  a download failed. It now reports "N downloaded, M failed" for the files it
+  tried and exits 1 if any failed.
+- `download-all` and `wifi-transfer` go through recordings in date order, and
+  print one line for recordings already downloaded ("2 recording(s) to
+  download (5 already downloaded)", or "… all already downloaded") instead of
+  one line per skipped file.
 - **`status` reported a nearly full device as nearly empty, and vice versa.**
   `APP&SPACE` answers with *free* and total storage in **MB**
   (`MCU&SPA&<free>&<total>`), not used and total in KB. A brand-new 64 GB

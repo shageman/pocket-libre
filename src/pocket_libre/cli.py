@@ -563,33 +563,33 @@ def download_all(ctx, address: str | None, session_key: str | None,
             console.print("[dim]Authenticating...[/dim]")
             if not await cmd.authenticate(session_key):
                 console.print("[red]Auth failed.[/red]")
-                return []
+                return [], 1
             all_recs = await cmd.list_all_recordings()
 
         if since:
             all_recs = [r for r in all_recs if r.date >= since]
+        all_recs.sort(key=lambda r: (r.date, r.timestamp))
 
         if not all_recs:
             console.print("[yellow]No recordings found.[/yellow]")
-            return []
+            return [], 0
 
-        console.print(f"[bold]{len(all_recs)} recording(s) to download[/bold]\n")
+        jobs = [(r, out_root / r.date / f"{r.timestamp}.mp3") for r in all_recs]
+        todo = [(r, p) for r, p in jobs if not p.exists()]
+        existing = [p for r, p in jobs if p.exists()]
+        if not todo:
+            console.print(f"{len(all_recs)} recording(s) on the device, all already downloaded.")
+            return existing, 0
+        console.print(f"[bold]{len(todo)} recording(s) to download[/bold]"
+                      + (f" ({len(existing)} already downloaded)" if existing else "") + "\n")
 
         # Each download gets its own connection, so a dropped link is
         # retried instead of ending the run (see download_with_retry).
-        downloaded_paths = []
-        for i, rec in enumerate(all_recs, 1):
-            rec_dir = out_root / rec.date
-            rec_dir.mkdir(parents=True, exist_ok=True)
-            out_path = rec_dir / f"{rec.timestamp}.mp3"
-
-            if out_path.exists():
-                console.print(f"  [{i}/{len(all_recs)}] {rec.date}/{rec.timestamp} [dim](already exists, skipping)[/dim]")
-                downloaded_paths.append(out_path)
-                continue
-
+        downloaded_paths, failed = list(existing), 0
+        for i, (rec, out_path) in enumerate(todo, 1):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             console.print(
-                f"  [{i}/{len(all_recs)}] {rec.date}/{rec.timestamp} "
+                f"  [{i}/{len(todo)}] {rec.date}/{rec.timestamp} "
                 f"(~{rec.estimated_bytes // 1024:,} KB)..."
             )
 
@@ -606,12 +606,14 @@ def download_all(ctx, address: str | None, session_key: str | None,
                 downloaded_paths.append(out_path)
                 console.print(f"    [green]Saved {len(data):,} bytes[/green]")
             else:
+                failed += 1
                 console.print("    [red]Download failed; nothing saved. Re-run to try again.[/red]")
 
-        console.print(f"\n[bold green]Downloaded {len(downloaded_paths)} recording(s) to {out_root}[/bold green]")
-        return downloaded_paths
+        console.print(f"\n[bold]{len(todo) - failed} downloaded, {failed} failed[/bold] "
+                      f"(into {out_root})")
+        return downloaded_paths, failed
 
-    downloaded_paths = asyncio.run(_run())
+    downloaded_paths, failed = asyncio.run(_run())
 
     if do_process and downloaded_paths:
         console.print("\n[bold cyan]Processing recordings...[/bold cyan]\n")
@@ -622,6 +624,9 @@ def download_all(ctx, address: str | None, session_key: str | None,
                        style=get(config, "defaults", "summary_style", default="meeting"),
                        anthropic_key=None, hf_token=None, skip_summary=False,
                        output=str(path.parent))
+
+    if failed:
+        raise SystemExit(1)
 
 
 # ── Sync & Process ──────────────────────────────
@@ -1144,17 +1149,20 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
                 recs = await cmd.list_all_recordings()
                 if since:
                     recs = [r for r in recs if r.date >= since]
+                recs.sort(key=lambda r: (r.date, r.timestamp))
                 jobs = [(r, out_root / r.date / f"{r.timestamp}.mp3") for r in recs]
             todo = [(r, p) for r, p in jobs if overwrite or not p.exists()]
             skipped = len(jobs) - len(todo)
-            if skipped:
-                console.print(f"[dim]{skipped} recording(s) already downloaded, skipping.[/dim]")
+            if not jobs:
+                console.print("[yellow]No recordings on the device.[/yellow]")
+                return 0, 0
             if not todo:
-                console.print("[yellow]Nothing to download.[/yellow]")
+                console.print(f"{len(jobs)} recording(s) on the device, all already downloaded.")
                 return 0, 0
 
             console.print(
-                f"[bold]{len(todo)} recording(s) to download over WiFi.[/bold] "
+                f"[bold]{len(todo)} recording(s) to download over WiFi[/bold]"
+                + (f" ({skipped} already downloaded)" if skipped else "") + ". "
                 "This machine's WiFi switches to the device's network until done."
             )
             try:
