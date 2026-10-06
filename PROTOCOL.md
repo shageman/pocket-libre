@@ -239,6 +239,12 @@ never see it switch.
    1.7 the device accepts a second connection, then resets it before sending
    any data. Restart the AP for more files: `APP&WIFIC`, leave the network,
    `APP&WIFIO`, rejoin, wait for `WIFIS=1` (about 14 s).
+
+   On 1.8, a transfer connection was also seen reset at 0 bytes while it was
+   still within the limit. After such a reset, the device ignored the next
+   `APP&WIFIO` (no `MCU&WIFIO` within 5 s, and the AP did not come up); a
+   further `APP&WIFIC` / `APP&WIFIO` a few seconds later worked. Both happened
+   twice in one 12-file run.
 6. **Finish** with `APP&WIFIC` → `MCU&WIFIC`.
 
 **Never send `APP&U&WIFI` without a transfer connection open.** The device
