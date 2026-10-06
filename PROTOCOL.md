@@ -135,6 +135,12 @@ recording. What makes the device use it is unknown; a recording mode such as
 a phone call is one guess. Treat the timestamp as an opaque name, not
 something to parse as a date.
 
+The name comes from the device clock, which `APP&T&` sets. The vendor app sets
+it to UTC, and so does pocket-libre (`status`, the web UI). Names are UTC once
+either has set the clock.
+A client that sends local time instead leaves the clock in whichever zone was
+set last, and names flip between the two.
+
 ### USB Mass Storage
 
 The device can expose its storage as a USB drive. The vendor app switches this

@@ -296,10 +296,15 @@ class PocketCommander:
         return int(vals[0]) if vals else -1
 
     async def set_time(self, time_str: str | None = None) -> bool:
-        """Set device time. Format: YYYYMMDDHHmmss."""
+        """Set device time. Format: YYYYMMDDHHmmss, in UTC.
+
+        The vendor app sends UTC too. Recordings are named after this clock, so
+        sending local time here would leave their names in whichever zone was
+        set last.
+        """
         if time_str is None:
-            from datetime import datetime
-            time_str = datetime.now().strftime("%Y%m%d%H%M%S")
+            from datetime import datetime, timezone
+            time_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         responses = await self._send(f"T&{time_str}")
         return any("MCU&T&OK" in r for r in responses)
 

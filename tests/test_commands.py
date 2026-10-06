@@ -192,6 +192,20 @@ class _RecordingSend:
 
 
 @pytest.mark.asyncio
+async def test_set_time_sends_utc(cmd, monkeypatch):
+    """The vendor app sets the clock to UTC; recordings are named after it."""
+    from datetime import datetime, timezone
+
+    recorder = _RecordingSend()
+    monkeypatch.setattr(cmd, "_send", recorder)
+    before = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None)
+    await cmd.set_time()
+    after = datetime.now(timezone.utc).replace(tzinfo=None)
+    sent = datetime.strptime(recorder.sent[0], "T&%Y%m%d%H%M%S")
+    assert before <= sent <= after
+
+
+@pytest.mark.asyncio
 async def test_wifi_trigger_and_enable_are_separable(cmd, monkeypatch):
     """Credentials must be readable between triggering WiFi mode and
     bringing the AP up — the order the vendor app uses (PROTOCOL.md)."""

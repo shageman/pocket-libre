@@ -84,6 +84,10 @@ confirmed it on 1.7.
   `storage_total_kb` are now `storage_used_mb` / `storage_total_mb`.
   Reported on firmware 1.7 in
   [#11](https://github.com/shahcolate/pocket-libre/issues/11).
+- **`status` and the web UI set the device clock to local time.** The
+  vendor app sets it to UTC, so the clock flipped between the two depending on
+  which connected last, and recording names (which follow the clock) could be
+  hours off. `set_time()` now sends UTC.
 - **A BLE disconnect mid-download crashed `download-all`** with `BleakError:
   Service Discovery has not been performed yet`, raised while unsubscribing
   from a link that was already gone. Without the crash it was worse: the
