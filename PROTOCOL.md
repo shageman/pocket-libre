@@ -124,7 +124,11 @@ Format: `MCU&F&<date>&<timestamp>&<duration_seconds>`
 > ([#4](https://github.com/shahcolate/pocket-libre/issues/4)). Multiply by
 > 4000 B/s (32 kbps) to estimate the size on disk.
 
-Ends with: `MCU&LIST&<count>` (zero-padded)
+Ends with: `MCU&LIST&<count>` (zero-padded), the number of `MCU&F` entries
+before it; a date without recordings answers `MCU&LIST&0`. Confirmed on
+firmware 1.8 (2026-10-06). The answer can take longer than a fixed wait, so
+a listing without this line, or with fewer entries than it counts, is
+incomplete rather than empty.
 
 **Recording names.** The timestamp is usually `YYYYMMDDHHmmss`, the time the
 recording started. A second form, `PH` + `YYMMDDHHmmss`, also occurs:
@@ -165,6 +169,21 @@ Captured from the vendor Android app (HCI snoop log) on 2026-10-03 and
 verified on hardware with `pocket-libre usb on`: the device's storage shows
 up as a USB drive. `GET&USB` is the only `GET&` command seen so far; others
 may exist.
+
+### Deleting a Recording
+
+```
+>> APP&D&2026-10-03&20261003081846
+<< MCU&D
+```
+
+Deletes one recording; the others on the device stay put. Confirmed on
+firmware 1.8 (2026-10-04) by listing before and after. The reply carries no
+status, so check the deletion by listing the date again, and trust only a
+complete listing (see `MCU&LIST&<count>` above). The command was
+guessed from the vendor app's command names and the `LIST` format, not
+captured from the vendor app; what it answers for a recording that doesn't
+exist is untested.
 
 ### BLE File Transfer
 

@@ -12,10 +12,14 @@ Usage:
 """
 
 import asyncio
+import json
+import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from bleak import BleakClient
 from bleak.exc import BleakError
@@ -83,6 +87,114 @@ class Recording:
             f"{self.date}/{self.timestamp} "
             f"({mins}m{secs:02d}s, ~{self.estimated_bytes:,} bytes)"
         )
+
+
+# Next to the recordings of each date, what each download wrote there:
+# {"<timestamp>.mp3": {"size": <bytes>, "duration_s": <seconds listed>}} for a
+# verified download, {"<timestamp>.mp3": {"verified": false}} for one that
+# couldn't be checked (or is being written).
+DOWNLOADS_FILE = ".downloads.json"
+
+
+def _downloads(directory: Path) -> dict:
+    try:
+        entries = json.loads((directory / DOWNLOADS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return entries if isinstance(entries, dict) else {}
+
+
+def _set_entry(path: Path, entry: dict) -> None:
+    entries = _downloads(path.parent)
+    entries[path.name] = entry
+    # A temp name of its own: another process may be saving to this date too.
+    # If both do, one record can be lost, which only keeps a recording. Opened
+    # like any other new file, so it gets the usual mode: a service saving
+    # recordings and a user deleting them can share it.
+    tmp = path.parent / f"{DOWNLOADS_FILE}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "x") as fh:
+            fh.write(json.dumps(entries, indent=1, sort_keys=True) + "\n")
+        tmp.replace(path.parent / DOWNLOADS_FILE)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def record_download(path, size: int, duration_s: int) -> None:
+    """Note that a verified download of a recording listed with `duration_s`
+    wrote `size` bytes to `path`.
+
+    Only a download that checked the size the device announces may call
+    this; has_complete_copy() relies on it before deleting from the device.
+    """
+    _set_entry(Path(path), {"size": size, "duration_s": duration_s})
+
+
+def mark_unverified(path) -> None:
+    """Note that `path` holds (or is about to hold) a download that wasn't
+    checked against the announced size: never deleted, downloaded again."""
+    _set_entry(Path(path), {"verified": False})
+
+
+def save_recording(path, data: bytes, verified: bool, recording: Recording) -> None:
+    """Write a download to `path`, and record it if `verified` (see
+    download_checked).
+
+    The file is marked unverified first and written through a .part file, so
+    a crash or full disk at any point leaves either that mark (the next run
+    downloads it again) or a complete, recorded copy.
+    """
+    path = Path(path)
+    partial = path.with_name(path.name + ".part")
+    mark_unverified(path)
+    try:
+        partial.write_bytes(data)
+        partial.replace(path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    if verified:
+        record_download(path, len(data), recording.duration_s)
+
+
+def needs_download(path) -> bool:
+    """True if `path` is missing, or holds a download marked unverified.
+
+    A file without any record (one from before records were kept) counts as
+    downloaded, as it always has.
+    """
+    path = Path(path)
+    if not path.exists():
+        return True
+    entry = _downloads(path.parent).get(path.name)
+    return isinstance(entry, dict) and entry.get("verified") is False
+
+
+def has_complete_copy(path, listed: Recording) -> bool:
+    """True if `path` is a verified download of the recording the device lists
+    now as `listed`.
+
+    The file must have exactly the size its download recorded, and the device
+    must list the same duration it did then, so a recording that grew after
+    it was downloaded, or a name reused for a new recording, is kept. A file
+    without a record (downloaded before records were kept, which older
+    versions may have saved cut short, or put there by something else) never
+    counts, whatever its size. Deleting from the device can't be undone, so
+    this errs towards keeping recordings.
+    """
+    path = Path(path)
+    entry = _downloads(path.parent).get(path.name)
+    if not isinstance(entry, dict):
+        return False
+    size, duration_s = entry.get("size"), entry.get("duration_s")
+    if not (isinstance(size, int) and size > 0 and isinstance(duration_s, int)
+            and duration_s > 0 and duration_s == listed.duration_s):
+        return False
+    try:
+        return path.stat().st_size == size
+    except OSError:
+        return False
 
 
 class PocketCommander:
@@ -345,26 +457,62 @@ class PocketCommander:
 
     async def list_files(self, date: str) -> list[Recording]:
         """List recordings for a date. Returns list of Recording objects."""
-        responses = await self._send(f"LIST&{date}")
+        recordings, _ = self._parse_listing(await self._send(f"LIST&{date}"))
+        return recordings
+
+    async def list_files_complete(self, date: str, tries: int = 2) -> list[Recording] | None:
+        """List recordings for a date, or None if no complete listing arrived.
+
+        A listing is complete when it ends with MCU&LIST&<count> and the count
+        matches the MCU&F entries. Without that, an empty or short answer
+        can't be told from a reply that came too late for _send.
+        """
+        for attempt in range(tries):
+            if attempt:
+                # Let a late answer to the last LIST arrive, so _send drops it
+                # instead of mixing it into the next one.
+                await asyncio.sleep(1.0)
+            recordings, complete = self._parse_listing(await self._send(f"LIST&{date}"))
+            if complete:
+                return recordings
+        return None
+
+    @staticmethod
+    def _parse_listing(responses: list[str]) -> tuple[list[Recording], bool]:
+        """The recordings in a LIST answer, and whether the answer was complete.
+
+        Every well-formed entry counts towards completeness, including one
+        skipped for an unsafe name, so such a name can't make its date's
+        listing incomplete for good. A malformed line makes it incomplete
+        rather than silently shorter.
+        """
         recordings = []
+        well_formed = 0
+        count = None
         for r in responses:
+            if r.startswith(f"{RSP_PREFIX}LIST&"):
+                value = r[len(f"{RSP_PREFIX}LIST&"):].strip()
+                count = int(value) if value.isdigit() else None
+                continue
             if not r.startswith(f"{RSP_PREFIX}F&"):
                 continue
             # MCU&F&2026-03-28&20260328001919&6222
             # The trailing field is a duration in seconds (see protocol.py).
             parts = r.split("&")
-            if len(parts) >= 5:
-                rec_date = parts[2]
-                timestamp = parts[3]
-                if not (is_safe_id(rec_date) and is_safe_id(timestamp)):
-                    console.print(
-                        f"[yellow]Skipping recording with unsafe name: "
-                        f"{rec_date}/{timestamp}[/yellow]"
-                    )
-                    continue
-                duration_s = int(parts[4]) if parts[4].isdigit() else 0
-                recordings.append(Recording(rec_date, timestamp, duration_s))
-        return recordings
+            if len(parts) < 5:
+                continue
+            well_formed += 1
+            rec_date = parts[2]
+            timestamp = parts[3]
+            if not (is_safe_id(rec_date) and is_safe_id(timestamp)):
+                console.print(
+                    f"[yellow]Skipping recording with unsafe name: "
+                    f"{rec_date}/{timestamp}[/yellow]"
+                )
+                continue
+            duration_s = int(parts[4]) if parts[4].isdigit() else 0
+            recordings.append(Recording(rec_date, timestamp, duration_s))
+        return recordings, count == well_formed
 
     async def list_all_recordings(self) -> list[Recording]:
         """List all recordings across all dates, oldest first.
@@ -381,6 +529,29 @@ class PocketCommander:
             if len(dirs) > 1:
                 await asyncio.sleep(0.2)
         return sorted(all_recs, key=lambda r: r.sort_key)
+
+    # ── Deleting ─────────────────────────────────
+
+    async def delete(self, recording: Recording) -> bool | None:
+        """Delete a recording from the device.
+
+        True once it is gone from a complete listing of its date, False if it
+        is still listed, None if no complete listing came back to tell.
+        APP&D&<date>&<timestamp> is answered by a bare MCU&D that carries no
+        status, so the listing is the only confirmation.
+        """
+        gone, _ = await self.delete_and_list(recording)
+        return gone
+
+    async def delete_and_list(self, recording: Recording
+                              ) -> tuple[bool | None, list[Recording] | None]:
+        """delete(), plus the complete listing of the date it was checked
+        against (None without one), for a caller deleting several."""
+        await self._send(f"D&{recording.date}&{recording.timestamp}")
+        remaining = await self.list_files_complete(recording.date)
+        if remaining is None:
+            return None, None
+        return all(r.timestamp != recording.timestamp for r in remaining), remaining
 
     # ── BLE File Transfer ────────────────────────
 
@@ -543,14 +714,37 @@ async def download_with_retry(
 ) -> bytes:
     """Download a recording with automatic retry on failure.
 
+    Returns MP3 bytes (trimmed to sync word) or empty bytes on total failure.
+    See download_checked, which also says whether the size was verified.
+    """
+    data, _ = await download_checked(address, session_key, recording, max_retries,
+                                     progress_callback, retry_delay)
+    return data
+
+
+async def download_checked(
+    address: str,
+    session_key: str,
+    recording: Recording,
+    max_retries: int = 3,
+    progress_callback=None,
+    retry_delay: float = 3.0,
+) -> tuple[bytes, bool]:
+    """Download a recording with automatic retry on failure.
+
     Creates its own BLE connection for each attempt. On disconnect or
     short data, waits briefly and retries from scratch. A partial transfer
     is never returned: callers write whatever comes back to its final path.
 
-    Returns MP3 bytes (trimmed to sync word) or empty bytes on total failure.
+    Returns (MP3 bytes trimmed to the sync word, verified), or (b"", False)
+    on total failure. Verified means the device announced a size and exactly
+    that many bytes arrived; only then may the size be recorded for deleting
+    (save_recording). An attempt without an announced size is retried; if
+    every attempt lacks one, the last data is returned unverified.
     """
     from pocket_libre.protocol import MP3_SYNC_WORD
 
+    unverified = b""
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
@@ -578,6 +772,9 @@ async def download_with_retry(
                     )
                     continue
 
+                # Checked against the raw transfer, before the trim below.
+                verified = 0 < expected_size == len(data)
+
                 # Trim to MP3 sync word
                 mp3_start = data.find(MP3_SYNC_WORD)
                 if mp3_start > 0:
@@ -593,10 +790,18 @@ async def download_with_retry(
                         )
                         continue
 
-                return data
+                if expected_size <= 0:
+                    # Nothing to check the transfer against; ask again.
+                    console.print("[yellow]The device did not announce the size; "
+                                  "nothing to check the transfer against.[/yellow]")
+                    unverified = data
+                    continue
+                return data, verified
 
         except Exception as e:
             console.print(f"[yellow]Attempt {attempt} failed: {e}[/yellow]")
 
+    if unverified:
+        return unverified, False
     console.print("[red]All retry attempts exhausted.[/red]")
-    return b""
+    return b"", False

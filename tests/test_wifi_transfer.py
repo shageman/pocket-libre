@@ -583,6 +583,44 @@ def test_an_access_point_that_never_comes_back_stops_the_batch(monkeypatch, tmp_
     assert "1 downloaded, 1 failed" in result.output
 
 
+@pytest.mark.parametrize("fail", [_bleak_error, _silent_disconnect])
+def test_delete_after_is_skipped_once_the_ble_link_is_lost(monkeypatch, tmp_path, fail):
+    from pocket_libre import cli as cli_module
+
+    calls = []
+    monkeypatch.setattr(cli_module, "_delete_downloaded", lambda *a, **kw: calls.append(a))
+    result = run_wifi_transfer(monkeypatch, tmp_path, fail, args=("--delete-after",))
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert calls == []
+    assert "Not deleting" in result.output
+
+
+def test_delete_after_does_not_wait_when_nothing_was_downloaded(monkeypatch, tmp_path):
+    from pocket_libre import cli as cli_module
+
+    calls, sleeps = [], []
+    monkeypatch.setattr(cli_module, "_delete_downloaded", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(cli_module.time, "sleep", sleeps.append)
+    (tmp_path / "2026-10-03").mkdir()
+    for ts in FILES:  # everything is downloaded already: the AP is never raised
+        (tmp_path / "2026-10-03" / f"{ts}.mp3").write_bytes(b"mp3")
+    result = run_wifi_transfer(monkeypatch, tmp_path, args=("--delete-after",))
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_delete_after_runs_after_a_clean_transfer(monkeypatch, tmp_path):
+    from pocket_libre import cli as cli_module
+
+    calls = []
+    monkeypatch.setattr(cli_module, "_delete_downloaded", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(cli_module.time, "sleep", lambda s: None)
+    result = run_wifi_transfer(monkeypatch, tmp_path, args=("--delete-after",))
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
 def test_transfer_error_with_the_link_up_moves_on(monkeypatch, tmp_path):
     def fail(cmd):
         raise WifiTransferError("no data")
@@ -774,3 +812,18 @@ def test_windows_profile_is_hidden_and_escaped():
     xml = windows_profile("A&B", "p<w>")
     assert "<name>A&amp;B</name>" in xml and "p&lt;w&gt;" in xml
     assert "<nonBroadcast>true</nonBroadcast>" in xml
+
+
+def test_wifi_transfer_records_the_size_of_each_download(monkeypatch, tmp_path):
+    """delete --downloaded only trusts a copy whose size its download recorded."""
+    import json
+
+    from pocket_libre.commands import DOWNLOADS_FILE
+
+    result = run_wifi_transfer(monkeypatch, tmp_path)
+    assert result.exit_code == 0, result.output
+    copies = list(tmp_path.glob("*/*.mp3"))
+    assert copies
+    book = json.loads((copies[0].parent / DOWNLOADS_FILE).read_text())
+    # The stub device lists every recording with duration 0 and sends 3 bytes.
+    assert book == {p.name: {"size": 3, "duration_s": 0} for p in copies}

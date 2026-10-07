@@ -52,6 +52,34 @@ confirmed it on 1.7.
   (e.g. `PH261002211958`), seen alongside the usual `YYYYMMDDHHmmss` names.
   They already worked; a test now keeps the listing parser from dropping them.
 
+- **`delete` removes recordings from the device** with `APP&D&<date>&<timestamp>`.
+  It deletes one recording (`--date`/`--timestamp`), or with `--downloaded` every
+  recording that has a verified copy in the output directory. It asks first
+  unless you pass `--yes`. `sync`, `download-all` and `wifi-transfer` take
+  `--delete-after` to do the same once they finish. A copy counts as verified
+  only if its size matches, to the byte, the size its download recorded in
+  `<date>/.downloads.json`, and the device still lists the recording with the
+  duration it had then, so a recording that grew after it was downloaded, or a
+  name reused for a new recording, is kept. `download-all`, `sync`,
+  `wifi-transfer` and `watch` record a download only when the transfer was
+  exactly the size the device announced; a transfer without an announced size
+  is tried again. One that still can't be checked is saved but marked
+  unverified, and the next run downloads it again. Recordings are written
+  through a `.part` file and marked unverified until they are recorded, so a
+  crash or full disk part way leaves a copy that is downloaded again. Copies
+  without any record, such as ones downloaded by earlier versions, by the web
+  UI or by `download`, are kept on the device and not downloaded again. The
+  record has the usual file mode, so a `watch` service and a user's `delete`
+  can share it. Each deletion is confirmed by a complete listing of the date
+  (one that ends in `MCU&LIST&<count>` with that many well-formed entries),
+  because the device's `MCU&D` reply carries no status; without one, the
+  deletion is reported as unconfirmed. If the device can't be reached for
+  deleting, the run says so and how to delete later. Also
+  `PocketCommander.delete()`, `PocketCommander.delete_and_list()`,
+  `PocketCommander.list_files_complete()`, `commands.download_checked()`,
+  `commands.has_complete_copy()`, `commands.needs_download()` and
+  `commands.save_recording()`.
+
 ### Changed
 
 - **WiFi status codes were mislabelled.** `MCU&WIFIS&3` is "AP coming up" and

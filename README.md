@@ -183,6 +183,7 @@ isn't scanning flat out all day.
 | `usb` | Show or set USB mass storage mode (`on`, `off`, `status`) |
 | `download` | Download one recording |
 | `download-all` | Download every recording |
+| `delete` | Delete recordings from the device: one, or every one already downloaded (`--downloaded`) |
 | `sync` | Download, transcribe, and summarize what's new |
 | `process` | Process an existing audio file |
 | `transcribe` | Transcribe locally with Whisper |
