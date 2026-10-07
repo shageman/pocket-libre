@@ -538,7 +538,9 @@ def download(ctx, address: str | None, session_key: str | None,
 @cli.command("download-all")
 @click.option("--address", default=None, help="BLE address of your Pocket device.")
 @click.option("--key", "session_key", default=None, help="Session key.")
-@click.option("--since", default=None, help="Only download recordings after this date (YYYY-MM-DD).")
+@click.option("--since", default=None,
+              help="Only recordings from this date (YYYY-MM-DD) on: the date of the "
+                   "recording's folder on the device, in UTC.")
 @click.option("--process", "do_process", is_flag=True, help="Transcribe and summarize after download.")
 @click.option("--output-dir", default=None, help="Output directory.")
 @click.pass_context
@@ -628,7 +630,9 @@ def download_all(ctx, address: str | None, session_key: str | None,
 @cli.command()
 @click.option("--address", default=None, help="BLE address of your Pocket device.")
 @click.option("--output-dir", default=None, help="Where to save recordings.")
-@click.option("--since", default=None, help="Only sync recordings after this date (YYYY-MM-DD).")
+@click.option("--since", default=None,
+              help="Only recordings from this date (YYYY-MM-DD) on: the date of the "
+                   "recording's folder on the device, in UTC.")
 @click.option("--whisper-model", default=None,
               type=click.Choice(["tiny.en", "base.en", "small.en", "medium.en", "large"]),
               help="Whisper model size.")
@@ -1038,7 +1042,8 @@ def wifi_discover(host: str | None, start_port: int, end_port: int, force: bool)
 @click.option("--date", default=None, help="Recording date (YYYY-MM-DD), with --timestamp.")
 @click.option("--timestamp", default=None, help="Recording timestamp, with --date.")
 @click.option("--since", default=None,
-              help="Without --date/--timestamp: only recordings from this date (YYYY-MM-DD) on.")
+              help="Without --date/--timestamp: only recordings from this date (YYYY-MM-DD) "
+                   "on: the date of the recording's folder on the device, in UTC.")
 @click.option("--output", default=None,
               help="Output file for a single recording (default: <timestamp>.mp3).")
 @click.option("--output-dir", default=None,

@@ -191,6 +191,52 @@ class _RecordingSend:
         return []
 
 
+@pytest.fixture
+def kolkata(monkeypatch):
+    """Local time five and a half hours off UTC, so sending it would show.
+
+    CI runners are on UTC, where local time and UTC agree.
+    """
+    import time
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset() is not available on Windows")
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.asyncio
+async def test_set_time_sends_utc(cmd, monkeypatch, kolkata):
+    """The vendor app sets the clock to UTC; recordings are named after it."""
+    from datetime import datetime, timezone
+
+    recorder = _RecordingSend()
+    monkeypatch.setattr(cmd, "_send", recorder)
+    before = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None)
+    await cmd.set_time()
+    after = datetime.now(timezone.utc).replace(tzinfo=None)
+    sent = datetime.strptime(recorder.sent[0], "T&%Y%m%d%H%M%S")
+    assert before <= sent <= after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("when", [
+    "2026-10-06T17:05:31-06:00",  # aware, in another zone
+    "2026-10-06T23:05:31+00:00",  # aware, already UTC
+    "2026-10-07T04:35:31",        # naive: local time (Asia/Kolkata here)
+])
+async def test_set_time_converts_a_given_time_to_utc(cmd, monkeypatch, kolkata, when):
+    from datetime import datetime
+
+    recorder = _RecordingSend()
+    monkeypatch.setattr(cmd, "_send", recorder)
+    await cmd.set_time(datetime.fromisoformat(when))
+    assert recorder.sent == ["T&20261006230531"]
+
+
 @pytest.mark.asyncio
 async def test_wifi_trigger_and_enable_are_separable(cmd, monkeypatch):
     """Credentials must be readable between triggering WiFi mode and
