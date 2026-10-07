@@ -122,6 +122,58 @@ async def test_list_files_parses_valid_rows(cmd, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_all_recordings_is_in_date_order(cmd, monkeypatch):
+    """The device's order is not guaranteed; every caller gets oldest first."""
+    listings = {
+        "2026-10-03": ["MCU&F&2026-10-03&20261003160000&10",
+                       "MCU&F&2026-10-03&20261003090000&10"],
+        "2026-10-02": ["MCU&F&2026-10-02&20261002110000&10"],
+    }
+
+    async def send(command, verbose=False):
+        if command == "LIST_DIRS":
+            return ["MCU&DIRS&2026-10-03", "MCU&DIRS&2026-10-02"]
+        return listings[command.split("&", 1)[1]]
+
+    monkeypatch.setattr(cmd, "_send", send)
+    monkeypatch.setattr("pocket_libre.commands.asyncio.sleep", _no_sleep)
+    recs = await cmd.list_all_recordings()
+    assert [r.timestamp for r in recs] == ["20261002110000", "20261003090000",
+                                           "20261003160000"]
+
+
+@pytest.mark.parametrize("names, expected", [
+    # PH + yyMMddHHmmss (phone calls) sorts by its time among the usual names.
+    (["20261002213000", "PH261002211958", "20261002090000"],
+     ["20261002090000", "PH261002211958", "20261002213000"]),
+    (["20261002120000", "PH261002080000"], ["PH261002080000", "20261002120000"]),
+])
+def test_recordings_sort_by_their_time_whatever_the_name_form(names, expected):
+    from pocket_libre.commands import Recording
+
+    recs = [Recording("2026-10-02", ts, 0) for ts in names]
+    assert [r.timestamp for r in sorted(recs, key=lambda r: r.sort_key)] == expected
+
+
+@pytest.mark.asyncio
+async def test_list_all_recordings_puts_ph_names_in_time_order(cmd, monkeypatch):
+    async def send(command, verbose=False):
+        if command == "LIST_DIRS":
+            return ["MCU&DIRS&2026-10-02"]
+        return ["MCU&F&2026-10-02&20261002213000&10", "MCU&F&2026-10-02&PH261002211958&10",
+                "MCU&F&2026-10-02&20261002090000&10"]
+
+    monkeypatch.setattr(cmd, "_send", send)
+    monkeypatch.setattr("pocket_libre.commands.asyncio.sleep", _no_sleep)
+    recs = await cmd.list_all_recordings()
+    assert [r.timestamp for r in recs] == ["20261002090000", "PH261002211958", "20261002213000"]
+
+
+async def _no_sleep(seconds):
+    return None
+
+
+@pytest.mark.asyncio
 async def test_list_files_keeps_ph_prefixed_names(cmd, monkeypatch):
     """Some recordings are named PH + YYMMDDHHmmss (issue #11, #18); they
     must not be dropped by a parser that expects a 14-digit timestamp."""

@@ -63,6 +63,16 @@ class Recording:
         return f"{self.timestamp}.mp3"
 
     @property
+    def sort_key(self) -> tuple[str, str]:
+        """(date, start time as YYYYMMDDHHmmss), for oldest-first order.
+
+        PH + YYMMDDHHmmss names (phone calls) are compared by the time they
+        carry, not as text, which would put them after every other name.
+        """
+        ts = self.timestamp
+        return self.date, "20" + ts[2:] if ts.startswith("PH") else ts
+
+    @property
     def estimated_bytes(self) -> int:
         """Approximate size on disk, derived from duration at 32 kbps."""
         return max(self.duration_s, 0) * BYTES_PER_SECOND
@@ -357,7 +367,11 @@ class PocketCommander:
         return recordings
 
     async def list_all_recordings(self) -> list[Recording]:
-        """List all recordings across all dates."""
+        """List all recordings across all dates, oldest first.
+
+        Sorted by date and start time (Recording.sort_key), whatever order the
+        device lists them in.
+        """
         dirs = await self.list_dirs()
         all_recs = []
         for d in dirs:
@@ -366,7 +380,7 @@ class PocketCommander:
             # Brief pause between directory listings to avoid overwhelming device MCU
             if len(dirs) > 1:
                 await asyncio.sleep(0.2)
-        return all_recs
+        return sorted(all_recs, key=lambda r: r.sort_key)
 
     # ── BLE File Transfer ────────────────────────
 
