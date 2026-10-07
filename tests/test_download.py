@@ -146,10 +146,10 @@ def test_download_all_never_writes_a_failed_download(tmp_path, monkeypatch):
             return [REC]
 
     async def failing_download(*args, **kwargs):
-        return b""
+        return b"", False
 
     monkeypatch.setattr(cli, "PocketCommander", _Lister)
-    monkeypatch.setattr(commands, "download_with_retry", failing_download)
+    monkeypatch.setattr(commands, "download_checked", failing_download)
     monkeypatch.setattr(cli, "load_config", lambda: {})
 
     result = CliRunner().invoke(cli.cli, [
@@ -179,10 +179,10 @@ def _run_download_all(tmp_path, monkeypatch, recs, args=()):
 
     async def download(address, key, rec, progress_callback=None):
         fetched.append(rec)
-        return FULL
+        return FULL, True
 
     monkeypatch.setattr(cli, "PocketCommander", _Lister)
-    monkeypatch.setattr(commands, "download_with_retry", download)
+    monkeypatch.setattr(commands, "download_checked", download)
     monkeypatch.setattr(cli, "load_config", lambda: {})
     result = CliRunner().invoke(cli.cli, [
         "download-all", "--address", "addr", "--key", "k" * 16,

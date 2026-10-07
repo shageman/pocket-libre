@@ -94,17 +94,6 @@ class Recording:
 DOWNLOADS_FILE = ".downloads.json"
 
 
-class VerifiedDownload(bytes):
-    """A recording whose length matched the size the device announced.
-
-    download_with_retry returns one when it could check; save_recording
-    records the size of nothing else. Slicing gives plain bytes, which
-    is unverified again.
-    """
-
-    verified = True
-
-
 def _downloads(directory: Path) -> dict[str, int]:
     try:
         entries = json.loads((directory / DOWNLOADS_FILE).read_text())
@@ -126,6 +115,11 @@ def record_download(path, size: int) -> None:
     # If both do, one record can be lost, which only keeps a recording.
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=DOWNLOADS_FILE + ".", suffix=".tmp")
     try:
+        # mkstemp makes the file 0600; give it the mode any other file would get,
+        # so a service saving recordings and a user deleting them can share it.
+        mask = os.umask(0)
+        os.umask(mask)
+        os.chmod(tmp, 0o666 & ~mask)
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps(entries, indent=1, sort_keys=True) + "\n")
         Path(tmp).replace(path.parent / DOWNLOADS_FILE)
@@ -134,11 +128,12 @@ def record_download(path, size: int) -> None:
         raise
 
 
-def save_recording(path, data: bytes) -> None:
-    """Write a download to `path`, and record its size if it was verified."""
+def save_recording(path, data: bytes, verified: bool) -> None:
+    """Write a download to `path`, and record its size if `verified`
+    (see download_checked)."""
     path = Path(path)
     path.write_bytes(data)
-    if getattr(data, "verified", False):
+    if verified:
         record_download(path, len(data))
 
 
@@ -445,10 +440,13 @@ class PocketCommander:
     def _parse_listing(responses: list[str]) -> tuple[list[Recording], bool]:
         """The recordings in a LIST answer, and whether the answer was complete.
 
-        Only entries that parse count towards completeness: a garbled line
-        makes the listing incomplete rather than silently shorter.
+        Every well-formed entry counts towards completeness, including one
+        skipped for an unsafe name, so such a name can't make its date's
+        listing incomplete for good. A malformed line makes it incomplete
+        rather than silently shorter.
         """
         recordings = []
+        well_formed = 0
         count = None
         for r in responses:
             if r.startswith(f"{RSP_PREFIX}LIST&"):
@@ -460,18 +458,20 @@ class PocketCommander:
             # MCU&F&2026-03-28&20260328001919&6222
             # The trailing field is a duration in seconds (see protocol.py).
             parts = r.split("&")
-            if len(parts) >= 5:
-                rec_date = parts[2]
-                timestamp = parts[3]
-                if not (is_safe_id(rec_date) and is_safe_id(timestamp)):
-                    console.print(
-                        f"[yellow]Skipping recording with unsafe name: "
-                        f"{rec_date}/{timestamp}[/yellow]"
-                    )
-                    continue
-                duration_s = int(parts[4]) if parts[4].isdigit() else 0
-                recordings.append(Recording(rec_date, timestamp, duration_s))
-        return recordings, count == len(recordings)
+            if len(parts) < 5:
+                continue
+            well_formed += 1
+            rec_date = parts[2]
+            timestamp = parts[3]
+            if not (is_safe_id(rec_date) and is_safe_id(timestamp)):
+                console.print(
+                    f"[yellow]Skipping recording with unsafe name: "
+                    f"{rec_date}/{timestamp}[/yellow]"
+                )
+                continue
+            duration_s = int(parts[4]) if parts[4].isdigit() else 0
+            recordings.append(Recording(rec_date, timestamp, duration_s))
+        return recordings, count == well_formed
 
     async def list_all_recordings(self) -> list[Recording]:
         """List all recordings across all dates, oldest first.
@@ -666,15 +666,37 @@ async def download_with_retry(
 ) -> bytes:
     """Download a recording with automatic retry on failure.
 
+    Returns MP3 bytes (trimmed to sync word) or empty bytes on total failure.
+    See download_checked, which also says whether the size was verified.
+    """
+    data, _ = await download_checked(address, session_key, recording, max_retries,
+                                     progress_callback, retry_delay)
+    return data
+
+
+async def download_checked(
+    address: str,
+    session_key: str,
+    recording: Recording,
+    max_retries: int = 3,
+    progress_callback=None,
+    retry_delay: float = 3.0,
+) -> tuple[bytes, bool]:
+    """Download a recording with automatic retry on failure.
+
     Creates its own BLE connection for each attempt. On disconnect or
     short data, waits briefly and retries from scratch. A partial transfer
     is never returned: callers write whatever comes back to its final path.
 
-    Returns MP3 bytes (trimmed to sync word) or empty bytes on total failure:
-    a VerifiedDownload when they are exactly the size the device announced.
+    Returns (MP3 bytes trimmed to the sync word, verified), or (b"", False)
+    on total failure. Verified means the device announced a size and exactly
+    that many bytes arrived; only then may the size be recorded for deleting
+    (save_recording). An attempt without an announced size is retried; if
+    every attempt lacks one, the last data is returned unverified.
     """
     from pocket_libre.protocol import MP3_SYNC_WORD
 
+    unverified = b""
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
@@ -702,6 +724,9 @@ async def download_with_retry(
                     )
                     continue
 
+                # Checked against the raw transfer, before the trim below.
+                verified = 0 < expected_size == len(data)
+
                 # Trim to MP3 sync word
                 mp3_start = data.find(MP3_SYNC_WORD)
                 if mp3_start > 0:
@@ -717,14 +742,18 @@ async def download_with_retry(
                         )
                         continue
 
-                # Verified only if there was an announced size and the file
-                # is exactly that long; anything else is still returned.
-                if 0 < expected_size == len(data):
-                    return VerifiedDownload(data)
-                return data
+                if expected_size <= 0:
+                    # Nothing to check the transfer against; ask again.
+                    console.print("[yellow]The device did not announce the size; "
+                                  "nothing to check the transfer against.[/yellow]")
+                    unverified = data
+                    continue
+                return data, verified
 
         except Exception as e:
             console.print(f"[yellow]Attempt {attempt} failed: {e}[/yellow]")
 
+    if unverified:
+        return unverified, False
     console.print("[red]All retry attempts exhausted.[/red]")
-    return b""
+    return b"", False

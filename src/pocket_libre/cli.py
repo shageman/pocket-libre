@@ -589,7 +589,7 @@ def download_all(ctx, address: str | None, session_key: str | None,
     address = _require_address(address, config)
     session_key = _require_session_key(session_key, config)
     out_root = Path(get_output_dir(config, output_dir))
-    from pocket_libre.commands import download_with_retry, record_download
+    from pocket_libre.commands import download_checked, record_download
 
     async def _run():
         async with PocketCommander(address) as cmd:
@@ -610,7 +610,7 @@ def download_all(ctx, address: str | None, session_key: str | None,
         console.print()
 
         # Each download gets its own connection, so a dropped link is
-        # retried instead of ending the run (see download_with_retry).
+        # retried instead of ending the run (see download_checked).
         downloaded_paths, failed = list(existing), 0
         for i, (rec, out_path) in enumerate(todo, 1):
             console.print(
@@ -623,7 +623,8 @@ def download_all(ctx, address: str | None, session_key: str | None,
                     pct = 100 * current // total
                     console.print(f"\r    [dim]{pct}%[/dim]", end="")
 
-            data = await download_with_retry(address, session_key, rec, progress_callback=progress)
+            data, verified = await download_checked(address, session_key, rec,
+                                                    progress_callback=progress)
             console.print()
 
             if not data:
@@ -637,7 +638,8 @@ def download_all(ctx, address: str | None, session_key: str | None,
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 partial.write_bytes(data)
                 partial.replace(out_path)
-                record_download(out_path, len(data))
+                if verified:
+                    record_download(out_path, len(data))
             except OSError as e:
                 failed += 1
                 try:
@@ -715,8 +717,24 @@ def _delete_downloaded(address: str, session_key: str, out_root: Path,
                 raise click.ClickException("Authentication failed.")
             return await cmd.list_all_recordings()
 
+    def unreachable(error: Exception) -> None:
+        console.print(f"[red]Could not reach the device to delete recordings: {error}[/red]")
+        console.print("[yellow]Nothing more was deleted. Run `pocket-libre delete "
+                      "--downloaded` once it connects again.[/yellow]")
+        raise SystemExit(1)
+
     console.print("\n[bold]Removing downloaded recordings from the device...[/bold]")
-    recs = asyncio.run(_list())
+    # Right after a transfer the device can take a moment to answer again.
+    for attempt in (1, 2):
+        try:
+            recs = asyncio.run(_list())
+            break
+        except click.ClickException:
+            raise
+        except Exception as e:  # not found, BleakError, a dropped connection
+            if attempt == 2:
+                unreachable(e)
+            time.sleep(5)
     if since:
         recs = [r for r in recs if r.date >= since]
     done = [r for r in recs if has_complete_copy(out_root / r.date / r.filename)]
@@ -732,7 +750,12 @@ def _delete_downloaded(address: str, session_key: str, out_root: Path,
             console.print(f"  {r}")
         click.confirm(f"Delete these {len(done)} recording(s) from the device? "
                       "This can't be undone", abort=True)
-    deleted = asyncio.run(_delete_recordings(address, session_key, done))
+    try:
+        deleted = asyncio.run(_delete_recordings(address, session_key, done))
+    except click.ClickException:
+        raise
+    except Exception as e:
+        unreachable(e)
     console.print(f"[bold]{deleted} of {len(done)} recording(s) deleted from the device.[/bold]")
     if deleted < len(done):
         raise SystemExit(1)
@@ -825,7 +848,7 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
     transcribes with Whisper (locally) and summarizes with Claude Haiku
     (~$0.001 per recording). Skips recordings already on disk.
     """
-    from pocket_libre.commands import download_with_retry, save_recording
+    from pocket_libre.commands import download_checked, save_recording
 
     config = ctx.obj["config"]
     address = _require_address(address, config)
@@ -890,14 +913,15 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
                     pct = 100 * current // total
                     console.print(f"\r  [dim]{pct}%[/dim]", end="")
 
-            data = await download_with_retry(address, session_key, rec, progress_callback=progress)
+            data, verified = await download_checked(address, session_key, rec,
+                                                    progress_callback=progress)
             console.print()
 
             if not data:
                 console.print("  [red]Failed to download.[/red]")
                 continue
 
-            save_recording(audio_path, data)
+            save_recording(audio_path, data, verified)
             console.print(f"  [green]Saved {len(data):,} bytes[/green]")
 
             if skip_process:
@@ -1407,7 +1431,8 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
                       "lost. Run `pocket-libre delete --downloaded` once it connects "
                       "again.[/yellow]")
     elif delete_after:
-        time.sleep(3)  # let the device leave AP mode before listing over BLE
+        if done or failed:
+            time.sleep(3)  # the AP was up: let the device leave AP mode first
         _delete_downloaded(address, session_key, out_root, since, assume_yes=True)
     if failed:
         raise SystemExit(1)

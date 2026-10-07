@@ -10,8 +10,7 @@ from pocket_libre.commands import (
     DOWNLOADS_FILE,
     PocketCommander,
     Recording,
-    VerifiedDownload,
-    download_with_retry,
+    download_checked,
     has_complete_copy,
     record_download,
     save_recording,
@@ -21,6 +20,17 @@ DONE = Recording("2026-10-03", "20261003081846", 97)     # verified copy on disk
 SHORT = Recording("2026-10-03", "20261003090502", 3684)  # copy cut short since
 OLD = Recording("2026-10-03", "20261003101010", 60)      # copy from before sizes were recorded
 NEW = Recording("2026-10-03", "20261003192133", 5196)    # never downloaded
+
+
+@pytest.fixture(autouse=True)
+def no_listing_pause(monkeypatch):
+    """list_files_complete pauses a second before asking again; not needed here."""
+    real_sleep = commands.asyncio.sleep
+
+    async def sleep(seconds, *args, **kwargs):
+        return await real_sleep(0)
+
+    monkeypatch.setattr(commands.asyncio, "sleep", sleep)
 
 
 def _write(root, rec, size, recorded=None):
@@ -129,8 +139,8 @@ def test_save_recording_records_the_size_and_keeps_other_records(tmp_path):
     (tmp_path / DONE.date).mkdir()
     first = tmp_path / DONE.date / DONE.filename
     second = tmp_path / DONE.date / NEW.filename
-    save_recording(first, VerifiedDownload(b"\xff" * 10))
-    save_recording(second, VerifiedDownload(b"\xff" * 20))
+    save_recording(first, b"\xff" * 10, verified=True)
+    save_recording(second, b"\xff" * 20, verified=True)
     book = json.loads((tmp_path / DONE.date / DOWNLOADS_FILE).read_text())
     assert book == {DONE.filename: 10, NEW.filename: 20}
     assert has_complete_copy(first) and has_complete_copy(second)
@@ -139,7 +149,7 @@ def test_save_recording_records_the_size_and_keeps_other_records(tmp_path):
 def test_save_recording_writes_but_does_not_record_unverified_data(tmp_path):
     (tmp_path / DONE.date).mkdir()
     path = tmp_path / DONE.date / DONE.filename
-    save_recording(path, b"\xff" * 10)
+    save_recording(path, b"\xff" * 10, verified=False)
     assert path.read_bytes() == b"\xff" * 10
     assert not (tmp_path / DONE.date / DOWNLOADS_FILE).exists()
     assert not has_complete_copy(path)
@@ -162,11 +172,22 @@ def test_concurrent_records_do_not_share_a_temporary_file(tmp_path, monkeypatch)
     assert not list((tmp_path / DONE.date).glob("*.tmp"))
 
 
-class _BleCommander:
-    """download_with_retry's view of a BLE download."""
+def test_the_record_is_readable_like_the_recordings(tmp_path):
+    """mkstemp makes 0600 files; a watch service and a user's delete share this one."""
+    import os
+    import stat
 
-    announced = 0
-    data = b""
+    path = _write(tmp_path, DONE, 10, recorded=10)
+    mask = os.umask(0)
+    os.umask(mask)
+    mode = stat.S_IMODE((path.parent / DOWNLOADS_FILE).stat().st_mode)
+    assert mode == 0o666 & ~mask
+
+
+class _BleCommander:
+    """download_checked's view of a BLE download: one (announced, data) per attempt."""
+
+    attempts: list = []
 
     def __init__(self, address):
         self._disconnected = False
@@ -182,23 +203,28 @@ class _BleCommander:
         return True
 
     async def download_ble(self, rec, progress_callback=None):
-        self.last_expected_size = _BleCommander.announced
-        return _BleCommander.data
+        self.last_expected_size, data = _BleCommander.attempts.pop(0)
+        return data
+
+
+FRAMES = b"\xff\xf3" * 4_918
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("announced, data, verified", [
-    (9_836, b"\xff\xf3" * 4_918, True),        # the announced size, exactly
-    (0, b"\xff\xf3" * 4_918, False),           # MCU&U&<size> missed: nothing to check against
-    (9_000, b"\xff\xf3" * 4_918, False),       # more than announced
+@pytest.mark.parametrize("attempts, data, verified", [
+    ([(9_836, FRAMES)], FRAMES, True),                 # the announced size, exactly
+    ([(9_000, FRAMES)], FRAMES, False),                # more than announced
+    ([(9_840, b"\0" * 4 + FRAMES)], FRAMES, True),     # leading bytes: checked before the trim
+    ([(0, FRAMES), (9_836, FRAMES)], FRAMES, True),    # size missed once: asked again
+    ([(0, FRAMES)] * 3, FRAMES, False),                # missed every time: kept, unverified
 ])
-async def test_download_is_verified_only_against_the_announced_size(monkeypatch, announced,
+async def test_download_is_verified_only_against_the_announced_size(monkeypatch, attempts,
                                                                     data, verified):
     monkeypatch.setattr(commands, "PocketCommander", _BleCommander)
-    _BleCommander.announced, _BleCommander.data = announced, data
-    result = await download_with_retry("addr", "k", Recording("d", "t", 0), max_retries=1)
-    assert result == data
-    assert getattr(result, "verified", False) is verified
+    _BleCommander.attempts = list(attempts)
+    assert await download_checked("addr", "k", Recording("d", "t", 0), retry_delay=0) == (
+        data, verified)
+    assert _BleCommander.attempts == []
 
 
 @pytest.mark.asyncio
@@ -225,9 +251,17 @@ async def test_listing_is_asked_for_again_after_a_pause(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_an_unsafe_name_does_not_make_its_date_undeletable():
+    """Well-formed entries count, even ones skipped for their name."""
+    unsafe = ["MCU&F&2026-10-03&../../x&97", *_listing(NEW, count=2)]
+    cmd, _ = _commander(lambda c: ["MCU&D"] if c.startswith("D&") else unsafe)
+    assert await cmd.delete(DONE) is True
+
+
+@pytest.mark.asyncio
 async def test_a_dropped_entry_makes_the_listing_incomplete():
     """A garbled line for the recording must not pass as a complete listing without it."""
-    garbled = ["MCU&F&2026-10-03&../../x&97", *_listing(NEW, count=2)]
+    garbled = ["MCU&F&2026-10-03&2026100308", *_listing(NEW, count=2)]
     cmd, _ = _commander(lambda c: ["MCU&D"] if c.startswith("D&") else garbled)
     assert await cmd.delete(DONE) is None
 
@@ -336,9 +370,9 @@ def test_delete_rejects_bad_arguments(device, args):
 
 def test_download_all_delete_after(device, tmp_path, monkeypatch):
     async def download(address, key, rec, progress_callback=None):
-        return VerifiedDownload(b"\xff" * rec.estimated_bytes) if rec == NEW else b""
+        return (b"\xff" * rec.estimated_bytes, True) if rec == NEW else (b"", False)
 
-    monkeypatch.setattr(commands, "download_with_retry", download)
+    monkeypatch.setattr(commands, "download_checked", download)
     result = _run("download-all", "--output-dir", str(tmp_path), "--delete-after")
     assert result.exit_code == 0, result.output
     assert device.deleted == [DONE, NEW]  # NEW was downloaded, so its size was recorded
@@ -354,7 +388,7 @@ def test_wifi_transfer_delete_after_is_for_a_batch(device):
 
 def test_download_does_not_record_into_the_current_directory(device, tmp_path, monkeypatch):
     async def download(address, key, rec, progress_callback=None):
-        return VerifiedDownload(b"\xff" * 100)
+        return b"\xff" * 100
 
     monkeypatch.setattr(commands, "download_with_retry", download)
     monkeypatch.chdir(tmp_path)
@@ -362,3 +396,17 @@ def test_download_does_not_record_into_the_current_directory(device, tmp_path, m
     assert result.exit_code == 0, result.output
     assert (tmp_path / NEW.filename).exists()
     assert not (tmp_path / DOWNLOADS_FILE).exists()
+
+
+def test_delete_pass_that_cannot_connect_says_what_to_do(device, tmp_path, monkeypatch):
+    class _Asleep(_Device):
+        async def __aenter__(self):
+            raise Exception("Device addr not found. Make sure it's awake.")
+
+    monkeypatch.setattr(cli, "PocketCommander", _Asleep)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    result = _run("delete", "--downloaded", "--yes", "--output-dir", str(tmp_path))
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "delete --downloaded" in " ".join(result.output.split())
+    assert device.deleted == []

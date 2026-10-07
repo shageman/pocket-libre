@@ -596,6 +596,20 @@ def test_delete_after_is_skipped_once_the_ble_link_is_lost(monkeypatch, tmp_path
     assert "Not deleting" in result.output
 
 
+def test_delete_after_does_not_wait_when_nothing_was_downloaded(monkeypatch, tmp_path):
+    from pocket_libre import cli as cli_module
+
+    calls, sleeps = [], []
+    monkeypatch.setattr(cli_module, "_delete_downloaded", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(cli_module.time, "sleep", sleeps.append)
+    (tmp_path / "2026-10-03").mkdir()
+    for ts in FILES:  # everything is downloaded already: the AP is never raised
+        (tmp_path / "2026-10-03" / f"{ts}.mp3").write_bytes(b"mp3")
+    result = run_wifi_transfer(monkeypatch, tmp_path, args=("--delete-after",))
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1 and sleeps == []
+
+
 def test_delete_after_runs_after_a_clean_transfer(monkeypatch, tmp_path):
     from pocket_libre import cli as cli_module
 

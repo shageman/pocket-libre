@@ -113,7 +113,7 @@ async def sync_new_recordings(
     hf_token: str | None = None,
 ) -> int:
     """Download every recording not already on disk. Returns the count."""
-    from pocket_libre.commands import PocketCommander, download_with_retry, save_recording
+    from pocket_libre.commands import PocketCommander, download_checked, save_recording
 
     async with PocketCommander(address) as cmd:
         if not await cmd.authenticate(session_key):
@@ -134,11 +134,11 @@ async def sync_new_recordings(
         audio_path = rec_dir / f"{rec.timestamp}.mp3"
 
         console.print(f"[dim]Downloading {rec.date}/{rec.timestamp}...[/dim]")
-        data = await download_with_retry(address, session_key, rec)
+        data, verified = await download_checked(address, session_key, rec)
         if not data:
             continue
 
-        save_recording(audio_path, data)  # already trimmed to the first MP3 frame
+        save_recording(audio_path, data, verified)  # already trimmed to the first MP3 frame
         synced += 1
 
         if process:

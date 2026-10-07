@@ -59,15 +59,18 @@ confirmed it on 1.7.
   `--delete-after` to do the same once they finish. A copy counts as verified
   only if its size matches, to the byte, the size its download recorded in
   `<date>/.downloads.json`. `download-all`, `sync`, `wifi-transfer` and `watch`
-  record it only when the file is exactly the size the device announced.
-  Copies without a record are always kept: ones downloaded by earlier
-  versions, by the web UI or by `download`, and any download whose announced
-  size was missed. Each
-  deletion is confirmed by a complete listing of the date (one that ends in
-  `MCU&LIST&<count>` with that many entries), because the device's `MCU&D`
-  reply carries no status; without one, the deletion is reported as
-  unconfirmed. Also `PocketCommander.delete()`,
-  `PocketCommander.list_files_complete()`, `commands.has_complete_copy()` and
+  record it only when the transfer was exactly the size the device announced;
+  a transfer without an announced size is tried again. Copies without a
+  record are always kept: ones downloaded by earlier versions, by the web UI
+  or by `download`, and any download whose announced size never arrived. The
+  record has the same file mode as the recordings, so a `watch` service and a
+  user's `delete` can share it. Each deletion is confirmed by a complete
+  listing of the date (one that ends in `MCU&LIST&<count>` with that many
+  well-formed entries), because the device's `MCU&D` reply carries no status;
+  without one, the deletion is reported as unconfirmed. If the device can't be
+  reached for deleting, the run says so and how to delete later. Also
+  `PocketCommander.delete()`, `PocketCommander.list_files_complete()`,
+  `commands.download_checked()`, `commands.has_complete_copy()` and
   `commands.save_recording()`.
 
 ### Changed
