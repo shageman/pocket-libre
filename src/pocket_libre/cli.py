@@ -535,13 +535,15 @@ def download(ctx, address: str | None, session_key: str | None,
     asyncio.run(_run())
 
 
-def _plan_downloads(jobs: list[tuple[Recording, Path]], overwrite: bool = False,
+def _plan_downloads(jobs: list[tuple[Recording, Path]], listed: int,
+                    since: str | None = None, overwrite: bool = False,
                     hint: str = "") -> tuple[list[tuple[Recording, Path]], list[Path]]:
     """Split (recording, path) jobs into those to download and the paths that
     already have a copy, checking each path once, and say so in one line.
 
-    `hint` follows the "all already downloaded" message, e.g. how to download
-    again. Returns (todo, existing).
+    `listed` is how many recordings the device listed before `since` filtered
+    them. `hint` follows the "all already downloaded" message, e.g. how to
+    download again. Returns (todo, existing).
     """
     todo, existing = [], []
     for rec, path in jobs:
@@ -549,8 +551,10 @@ def _plan_downloads(jobs: list[tuple[Recording, Path]], overwrite: bool = False,
             existing.append(path)
         else:
             todo.append((rec, path))
-    if not jobs:
-        console.print("[yellow]No recordings match.[/yellow]")
+    if not listed:
+        console.print("[yellow]No recordings on the device.[/yellow]")
+    elif not jobs:
+        console.print(f"[yellow]No recordings from {since} on ({listed} on the device).[/yellow]")
     elif not todo:
         console.print(f"{len(jobs)} recording(s) to consider, all already downloaded{hint}.")
     else:
@@ -590,11 +594,12 @@ def download_all(ctx, address: str | None, session_key: str | None,
                 return [], 1
             all_recs = await cmd.list_all_recordings()
 
+        listed = len(all_recs)
         if since:
             all_recs = [r for r in all_recs if r.date >= since]
 
         jobs = [(r, out_root / r.date / f"{r.timestamp}.mp3") for r in all_recs]
-        todo, existing = _plan_downloads(jobs)
+        todo, existing = _plan_downloads(jobs, listed, since)
         if not todo:
             return existing, 0
         console.print()
@@ -1181,10 +1186,11 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
                 todo = [(rec, path)]
             else:
                 recs = await cmd.list_all_recordings()
+                listed = len(recs)
                 if since:
                     recs = [r for r in recs if r.date >= since]
                 jobs = [(r, out_root / r.date / f"{r.timestamp}.mp3") for r in recs]
-                todo, _ = _plan_downloads(jobs, overwrite,
+                todo, _ = _plan_downloads(jobs, listed, since, overwrite,
                                           hint=" (use --overwrite to download again)")
                 if not todo:
                     return 0, 0

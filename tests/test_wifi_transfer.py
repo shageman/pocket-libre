@@ -504,6 +504,12 @@ class StubCommander:
         return [Recording("2026-10-03", ts, 0) for ts in FILES]
 
 
+def _flat(result) -> str:
+    """The command's output with whitespace collapsed: the console wraps lines
+    at 80 columns, and a long temp path moves where the breaks fall."""
+    return " ".join(result.output.split())
+
+
 def run_wifi_transfer(monkeypatch, tmp_path, second_download_fails=None,
                       firmware="1.8.0", args=(), sessions=None, fetched=None):
     """Run the command over three recordings; the second download fails."""
@@ -601,8 +607,8 @@ def test_already_downloaded_recordings_are_counted_in_one_line(monkeypatch, tmp_
     (tmp_path / "2026-10-03" / f"{first}.mp3").write_bytes(b"mp3")
     result = run_wifi_transfer(monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
-    assert "2 recording(s) to download (1 already downloaded)" in result.output
-    assert "skipping" not in result.output
+    assert "2 recording(s) to download (1 already downloaded)" in _flat(result)
+    assert "skipping" not in _flat(result)
 
 
 def test_everything_downloaded_says_so_once(monkeypatch, tmp_path):
@@ -611,15 +617,24 @@ def test_everything_downloaded_says_so_once(monkeypatch, tmp_path):
         (tmp_path / "2026-10-03" / f"{ts}.mp3").write_bytes(b"mp3")
     result = run_wifi_transfer(monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
-    output = " ".join(result.output.split())  # the console wraps long lines
     assert ("3 recording(s) to consider, all already downloaded "
-            "(use --overwrite to download again).") in output
+            "(use --overwrite to download again).") in _flat(result)
 
 
 def test_since_that_matches_nothing_says_so(monkeypatch, tmp_path):
     result = run_wifi_transfer(monkeypatch, tmp_path, args=("--since", "2099-01-01"))
     assert result.exit_code == 0, result.output
-    assert "No recordings match." in result.output
+    assert "No recordings from 2099-01-01 on (3 on the device)." in _flat(result)
+
+
+def test_an_empty_device_says_so(monkeypatch, tmp_path):
+    async def nothing(self):
+        return []
+
+    monkeypatch.setattr(StubCommander, "list_all_recordings", nothing)
+    result = run_wifi_transfer(monkeypatch, tmp_path)
+    assert result.exit_code == 0, result.output
+    assert "No recordings on the device." in _flat(result)
 
 
 def test_existing_single_recording_claims_nothing_about_the_device(monkeypatch, tmp_path):
@@ -628,13 +643,13 @@ def test_existing_single_recording_claims_nothing_about_the_device(monkeypatch, 
     result = run_wifi_transfer(monkeypatch, tmp_path, args=(
         "--date", "2026-10-03", "--timestamp", "20261003142550", "--output", str(target)))
     assert result.exit_code == 0, result.output
-    assert "already exists (use --overwrite" in result.output
-    assert "device" not in result.output.split("already exists")[1]
+    assert "already exists (use --overwrite" in _flat(result)
+    assert "device" not in _flat(result).split("already exists")[1]
 
 
 def test_untested_firmware_needs_force_and_gets_one_file_per_session(monkeypatch, tmp_path):
     result = run_wifi_transfer(monkeypatch, tmp_path, firmware="1.3.3")
-    assert result.exit_code != 0 and "--force" in result.output
+    assert result.exit_code != 0 and "--force" in _flat(result)
 
     sessions = []
     result = run_wifi_transfer(monkeypatch, tmp_path, firmware="1.3.3", args=["--force"],

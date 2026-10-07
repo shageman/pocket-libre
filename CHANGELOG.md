@@ -92,12 +92,15 @@ confirmed it on 1.7.
   `.mp3`, and the remaining files are still tried.
 - `PocketCommander.list_all_recordings()` returns recordings oldest first,
   whatever order the device lists them in, so `download-all`, `wifi-transfer`,
-  `sync`, `watch` and the web UI all go in date order.
+  `sync`, `watch` and the web UI all go in date order. `PH…` names (phone
+  calls) sort by the time they carry, among the other recordings of their date
+  (`Recording.sort_key`).
 - `download-all` and `wifi-transfer` print one line for recordings already
   downloaded ("2 recording(s) to download (5 already downloaded)", or "N
   recording(s) to consider, all already downloaded") instead of one line per
-  skipped file, and "No recordings match." when nothing is left after
-  `--since`.
+  skipped file. They say "No recordings on the device." for an empty device,
+  and "No recordings from <date> on (N on the device)." when `--since` leaves
+  nothing.
 - **`status` reported a nearly full device as nearly empty, and vice versa.**
   `APP&SPACE` answers with *free* and total storage in **MB**
   (`MCU&SPA&<free>&<total>`), not used and total in KB. A brand-new 64 GB
