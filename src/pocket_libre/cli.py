@@ -1086,6 +1086,7 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
     from pocket_libre.protocol import FILES_PER_AP_SESSION
     from pocket_libre.wifi import (
         DEFAULT_HOST,
+        AccessPointError,
         WifiSession,
         WifiTransferError,
         files_per_ap_session,
@@ -1183,6 +1184,15 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
                             # reply; either way, nothing more will work.
                             if isinstance(e, BleakError) or not cmd.connected:
                                 lost_link(None, len(todo) - i)
+                                break
+                            # The restart was already tried three times; the
+                            # rest would only repeat it.
+                            if isinstance(e, AccessPointError):
+                                console.print("[yellow]The device's access point did not come "
+                                              "back; stopping.[/yellow]")
+                                if len(todo) - i:
+                                    console.print(f"[yellow]{len(todo) - i} recording(s) "
+                                                  "not attempted.[/yellow]")
                                 break
                             continue
                         rate = result.size / result.seconds / 1024 if result.seconds else 0

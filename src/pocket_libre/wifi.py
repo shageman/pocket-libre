@@ -261,6 +261,22 @@ class WifiTransferError(RuntimeError):
     """A WiFi transfer step failed; the message says which."""
 
 
+class AccessPointError(WifiTransferError):
+    """The device did not raise its access point."""
+
+
+class ConnectionDroppedError(WifiTransferError):
+    """The device reset or closed the transfer connection before sending any
+    of the file."""
+
+
+# Pauses between APP&WIFIC and APP&WIFIO when restarting the AP, one per try
+# (the first raise of a session skips the first one). Right after a reset
+# transfer, firmware 1.8 was seen to ignore the first WIFIO; the next restart
+# worked.
+AP_RESTART_WAITS = (2.0, 5.0, 10.0)
+
+
 def firmware_line(firmware: str) -> str:
     """The major.minor part of a firmware version: "1.8.0" -> "1.8"."""
     return ".".join(firmware.strip().split(".")[:2])
@@ -343,11 +359,14 @@ async def receive_file(
                         f"{what} after {timeout:g}s (expected {size:,} bytes)"
                     ) from None
                 except OSError as e:  # e.g. reset by the device
-                    raise WifiTransferError(
+                    error = ConnectionDroppedError if received == 0 else WifiTransferError
+                    raise error(
                         f"connection lost at {received:,} of {size:,} bytes: {e}"
                     ) from e
                 if not chunk:
-                    raise WifiTransferError(
+                    # Depending on the platform, a reset can also read as a close.
+                    error = ConnectionDroppedError if received == 0 else WifiTransferError
+                    raise error(
                         f"device closed the connection at {received:,} of {size:,} bytes"
                     )
                 timeout = idle_timeout
@@ -406,6 +425,7 @@ class WifiSession:
         connect_wait: float = 15.0,
         first_byte_timeout: float = 15.0,
         idle_timeout: float = 15.0,
+        ack_timeout: float = 5.0,
     ):
         self.cmd = cmd
         self.host_wifi = host_wifi
@@ -421,6 +441,7 @@ class WifiSession:
         self.connect_wait = connect_wait
         self.first_byte_timeout = first_byte_timeout
         self.idle_timeout = idle_timeout
+        self.ack_timeout = ack_timeout
         self.ssid: str | None = None
         self.password: str | None = None
         self.connections = 0
@@ -447,7 +468,7 @@ class WifiSession:
         self._audio = True
         if self.heartbeat > 0:
             self._tasks.append(asyncio.create_task(self._heartbeat()))
-        await self._raise_ap()
+        await self._bring_up_ap(restart=False)
 
     async def _raise_ap(self) -> None:
         """WIFIO, then WIFI for the credentials, then join while WIFIS is
@@ -455,8 +476,8 @@ class WifiSession:
         since = self.cmd.mark()
         self._raised = True
         raised_at = time.monotonic()
-        if await self.cmd.request("WIFIO", "WIFIO", timeout=5.0) is None:
-            raise WifiTransferError("The device did not acknowledge APP&WIFIO.")
+        if await self.cmd.request("WIFIO", "WIFIO", timeout=self.ack_timeout) is None:
+            raise AccessPointError("The device did not acknowledge APP&WIFIO.")
         if self.ssid is None:
             creds = await self.cmd.request("WIFI", "WIFI", timeout=5.0, accept=lambda v: "&" in v)
             if not creds:
@@ -487,15 +508,51 @@ class WifiSession:
         """Restart the access point: the device serves only
         `files_per_session` transfer connections per AP session."""
         self.log("Restarting the access point for the next files...")
-        await self.cmd.request("WIFIC", "WIFIC", timeout=5.0)
-        self._raised = False
-        await self.host_wifi.leave()
-        await asyncio.sleep(2.0)
-        await self._raise_ap()
+        await self._bring_up_ap(restart=True)
+
+    async def _bring_up_ap(self, restart: bool) -> None:
+        """Raise the access point, lowering it first when `restart`.
+
+        If the device ignores APP&WIFIO, it is lowered and raised again with
+        longer pauses (AP_RESTART_WAITS), up to three tries. This machine is
+        asked to leave the network only once: it is off the AP from then on.
+        """
+        for attempt, wait in enumerate(AP_RESTART_WAITS, 1):
+            if restart or attempt > 1:
+                await self.cmd.request("WIFIC", "WIFIC", timeout=self.ack_timeout)
+                self._raised = False
+                if restart and attempt == 1:
+                    await self.host_wifi.leave()
+                await asyncio.sleep(wait)
+            try:
+                await self._raise_ap()
+                return
+            except AccessPointError:
+                if attempt == len(AP_RESTART_WAITS) or not self.cmd.connected:
+                    raise
+                self.log("The access point did not come up; restarting it...")
 
     async def download(self, recording, out_path: str | Path,
                        progress_callback: Callable[[int, int], None] | None = None) -> TransferResult:
-        """Transfer one recording to `out_path` over WiFi."""
+        """Transfer one recording to `out_path` over WiFi.
+
+        If the device resets or closes the transfer connection before sending
+        any of the file (seen on firmware 1.8), the file is tried once more on
+        a fresh access point. Every other failure, including one part way
+        through, fails the file: the device's state is unknown, and Bluetooth
+        can fetch it instead.
+        """
+        try:
+            return await self._download(recording, out_path, progress_callback)
+        except ConnectionDroppedError as e:
+            if not self.cmd.connected:
+                raise
+            self.log(f"The device dropped the connection ({e}); "
+                     "trying the file again on a fresh access point...")
+        return await self._download(recording, out_path, progress_callback)
+
+    async def _download(self, recording, out_path: str | Path,
+                        progress_callback: Callable[[int, int], None] | None) -> TransferResult:
         if self.connections >= self.files_per_session:
             await self.cycle()
         # The connection must be open BEFORE the switch: APP&U&WIFI with no

@@ -35,6 +35,7 @@ from pocket_libre.protocol import (
     WIFI_STATUS_WAITING_FOR_CLIENT,
 )
 from pocket_libre.wifi import (
+    AccessPointError,
     TransferResult,
     WifiSession,
     WifiTransferError,
@@ -135,6 +136,52 @@ class FakeDevice:
             self.reply(f"MCU&U&{len(self.staged)}")
 
 
+class SluggishDevice(FakeDevice):
+    """Ignores the first `ignored` APP&WIFIO after an APP&WIFIC, as a 1.8
+    recorder did right after a transfer was reset."""
+
+    def __init__(self, port: int, ignored: int = 1, from_start: bool = False, **kw):
+        super().__init__(port, **kw)
+        self.ignored = ignored
+        self.cycled = from_start
+
+    async def handle(self, command: str) -> None:
+        if command == "WIFIC":
+            self.cycled = True
+        elif command == "WIFIO" and self.cycled and self.ignored:
+            self.ignored -= 1
+            self.sent.append(command)
+            return
+        await super().handle(command)
+
+
+class ResettingDevice(FakeDevice):
+    """Resets the first `times` transfers after sending `sent_before_reset`
+    bytes of each."""
+
+    def __init__(self, port: int, sent_before_reset: int, times: int = 1,
+                 rst: bool = True, **kw):
+        super().__init__(port, **kw)
+        self.sent_before_reset = sent_before_reset
+        self.times = times
+        self.rst = rst  # False: a clean close, as a reset reads on some platforms
+
+    async def handle(self, command: str) -> None:
+        if command == "U&WIFI" and self.resets < self.times and self.writer is not None:
+            self.resets += 1
+            self.sent.append(command)
+            self.writer.write(self.staged[: self.sent_before_reset])
+            await self.writer.drain()
+            if self.rst:
+                sock = self.writer.get_extra_info("socket")
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                self.writer.transport.abort()
+            else:
+                self.writer.close()
+            return
+        await super().handle(command)
+
+
 class FakeCommander(PocketCommander):
     """The real commander's message handling, with the device faked behind _write."""
 
@@ -182,7 +229,7 @@ def session_for(device, host_wifi, **kw):
     kw.setdefault("files_per_session", device.per_session)
     return WifiSession(FakeCommander(device), host_wifi, host="127.0.0.1", port=device.port,
                        heartbeat=0.05, status_interval=0.02, switch_delay=0.01,
-                       first_byte_timeout=2, idle_timeout=2, **kw)
+                       first_byte_timeout=2, idle_timeout=2, ack_timeout=0.2, **kw)
 
 
 @pytest.fixture(autouse=True)
@@ -264,7 +311,7 @@ async def test_missing_marker_is_reported_but_keeps_the_file(tmp_path):
 @pytest.mark.asyncio
 async def test_refused_connection_restarts_the_ap_for_the_next_file(tmp_path):
     """If the device stops listening early, the next file gets a fresh AP
-    instead of waiting on the same dead port."""
+    instead of waiting on the same dead port. The file itself is not retried."""
     device = FakeDevice(free_port())
     first, second = list(FILES)[:2]
     async with session_for(device, FakeHostWifi(device), connect_wait=0.2) as session:
@@ -291,19 +338,134 @@ async def test_firmware_1_7_restarts_the_ap_for_every_file(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reset_connection_fails_one_file_and_the_next_gets_a_fresh_ap(tmp_path):
-    """The 1.7 field report: two files per session against a device that
-    serves one. The reset must fail that file, not crash the run."""
+async def test_reset_before_any_data_retries_the_file_on_a_fresh_ap(tmp_path):
+    """The 1.7 field report, and seen on 1.8 too: the device drops a transfer
+    before sending any of it. The file is fetched again on a fresh AP.
+
+    Checks what happened rather than the error text: depending on the
+    platform, the reset reads as "connection lost" or as a close (#24)."""
     device = FakeDevice(free_port(), firmware="1.7")
+    logs = []
     first, second = list(FILES)[:2]
-    async with session_for(device, FakeHostWifi(device), files_per_session=2) as session:
+    async with session_for(device, FakeHostWifi(device), files_per_session=2,
+                           log=logs.append) as session:
         await session.download(Recording("2026-10-03", first, 0), tmp_path / "a.mp3")
-        with pytest.raises(WifiTransferError, match="connection lost at 0 of"):
-            await session.download(Recording("2026-10-03", second, 0), tmp_path / "b.mp3")
-        assert not (tmp_path / "b.mp3").exists() and not list(tmp_path.glob("*.part"))
-        await session.download(Recording("2026-10-03", second, 0), tmp_path / "b.mp3")
+        result = await session.download(Recording("2026-10-03", second, 0), tmp_path / "b.mp3")
     assert device.resets == 1 and device.ap_starts == 2
+    assert result.size == len(FILES[second])
     assert (tmp_path / "b.mp3").read_bytes() == FILES[second]
+    assert any("trying the file again" in line for line in logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rst", [True, False])
+async def test_dropped_before_any_data_retries_the_file(tmp_path, rst):
+    device = ResettingDevice(free_port(), sent_before_reset=0, rst=rst)
+    ts = "20261003160116"
+    async with session_for(device, FakeHostWifi(device)) as session:
+        await session.download(Recording("2026-10-03", ts, 0), tmp_path / "a.mp3")
+    assert device.resets == 1 and device.ap_starts == 2
+    assert (tmp_path / "a.mp3").read_bytes() == FILES[ts]
+
+
+@pytest.mark.asyncio
+async def test_reset_mid_file_fails_the_file_without_a_retry(tmp_path):
+    device = ResettingDevice(free_port(), sent_before_reset=1000)
+    ts = "20261003160116"
+    async with session_for(device, FakeHostWifi(device)) as session:
+        with pytest.raises(WifiTransferError, match="at 1,000 of"):
+            await session.download(Recording("2026-10-03", ts, 0), tmp_path / "a.mp3")
+        assert not (tmp_path / "a.mp3").exists() and not list(tmp_path.glob("*.part"))
+        await session.download(Recording("2026-10-03", ts, 0), tmp_path / "a.mp3")
+    assert device.ap_starts == 2  # the next file still gets a fresh AP
+    assert (tmp_path / "a.mp3").read_bytes() == FILES[ts]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_is_also_dropped_raises(tmp_path):
+    device = ResettingDevice(free_port(), sent_before_reset=0, times=2)
+    async with session_for(device, FakeHostWifi(device)) as session:
+        with pytest.raises(WifiTransferError, match="at 0 of"):
+            await session.download(Recording("2026-10-03", "20261003160116", 0),
+                                   tmp_path / "a.mp3")
+    assert device.resets == 2
+    assert device.sent.count("U&WIFI") == 2
+
+
+@pytest.mark.asyncio
+async def test_no_data_is_not_retried(tmp_path):
+    device = FakeDevice(free_port())
+    handle = device.handle
+
+    async def silent_switch(command):  # the device never sends the file
+        if command == "U&WIFI":
+            device.sent.append(command)
+            return
+        await handle(command)
+
+    device.handle = silent_switch
+    async with session_for(device, FakeHostWifi(device)) as session:
+        session.first_byte_timeout = 0.2
+        with pytest.raises(WifiTransferError, match="no data"):
+            await session.download(Recording("2026-10-03", "20261003160116", 0),
+                                   tmp_path / "a.mp3")
+    assert device.sent.count("U&WIFI") == 1
+    assert device.ap_starts == 1
+
+
+@pytest.mark.asyncio
+async def test_a_local_write_failure_is_not_retried(tmp_path):
+    """A full disk or a bad path fails the same way on a fresh AP."""
+    device = FakeDevice(free_port())
+    (tmp_path / "taken").write_text("a file, not a directory")
+    async with session_for(device, FakeHostWifi(device)) as session:
+        with pytest.raises(WifiTransferError, match="could not write"):
+            await session.download(Recording("2026-10-03", "20261003160116", 0),
+                                   tmp_path / "taken" / "a.mp3")
+    assert device.sent.count("U&WIFI") == 1
+    assert device.ap_starts == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_tries_again_when_the_device_ignores_wifio(tmp_path):
+    """Seen on 1.8 after a reset transfer: the WIFIO of the restart went
+    unanswered, and the next restart worked."""
+    device = SluggishDevice(free_port())
+    host_wifi = FakeHostWifi(device)
+    names = list(FILES)
+    async with session_for(device, host_wifi) as session:
+        for ts in names:
+            await session.download(Recording("2026-10-03", ts, 0), tmp_path / f"{ts}.mp3")
+    for ts in names:
+        assert (tmp_path / f"{ts}.mp3").read_bytes() == FILES[ts]
+    assert device.sent.count("WIFIO") == 3  # start, ignored, answered
+    assert device.ap_starts == 2
+    assert host_wifi.calls.count("leave") == 1  # one prompt to rejoin, not one per try
+
+
+@pytest.mark.asyncio
+async def test_first_raise_tries_again_when_the_device_ignores_wifio(tmp_path):
+    device = SluggishDevice(free_port(), from_start=True)
+    host_wifi = FakeHostWifi(device)
+    ts = "20261003160116"
+    async with session_for(device, host_wifi) as session:
+        await session.download(Recording("2026-10-03", ts, 0), tmp_path / "a.mp3")
+    assert (tmp_path / "a.mp3").read_bytes() == FILES[ts]
+    assert [c for c in device.sent if c in ("WIFIO", "WIFIC")][:3] == ["WIFIO", "WIFIC", "WIFIO"]
+    assert "leave" not in host_wifi.calls  # never on the AP, so nothing to leave
+
+
+@pytest.mark.asyncio
+async def test_restart_gives_up_after_its_tries(tmp_path):
+    device = SluggishDevice(free_port(), ignored=99)
+    names = list(FILES)
+    async with session_for(device, FakeHostWifi(device)) as session:
+        for ts in names[:2]:
+            await session.download(Recording("2026-10-03", ts, 0), tmp_path / f"{ts}.mp3")
+        with pytest.raises(AccessPointError, match="WIFIO"):
+            await session.download(Recording("2026-10-03", names[2], 0), tmp_path / "c.mp3")
+    assert device.sent.count("WIFIO") == 1 + 3  # start, then three tries
+    assert device.sent.count("U&WIFI") == 2  # the third file was not tried twice
 
 
 def test_files_per_ap_session_by_firmware():
@@ -399,6 +561,18 @@ def test_lost_ble_link_stops_the_batch_and_still_summarises(monkeypatch, tmp_pat
     assert "1 recording(s) not attempted" in result.output
     assert "1 downloaded, 1 failed" in result.output
     assert len(list(tmp_path.rglob("*.mp3"))) == 1
+
+
+def test_an_access_point_that_never_comes_back_stops_the_batch(monkeypatch, tmp_path):
+    """cycle() already tried three times; the other files would only repeat it."""
+    def fail(cmd):
+        raise AccessPointError("The device did not acknowledge APP&WIFIO.")
+
+    result = run_wifi_transfer(monkeypatch, tmp_path, fail)
+    assert result.exit_code == 1
+    assert "did not come back" in result.output
+    assert "1 recording(s) not attempted" in result.output
+    assert "1 downloaded, 1 failed" in result.output
 
 
 def test_transfer_error_with_the_link_up_moves_on(monkeypatch, tmp_path):
