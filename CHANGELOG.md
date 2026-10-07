@@ -75,12 +75,15 @@ confirmed it on 1.7.
 
 ### Fixed
 
-- **`wifi-transfer` recovers from two failures seen on firmware 1.8.** A
-  transfer reset before any data arrived is retried once on a fresh access
-  point (a reset part way through still fails the file). When the device does
-  not answer `APP&WIFIO` while restarting the access point, the restart is
-  tried again with longer pauses (2, 5, 10 s) instead of failing the next file.
-  In a 12-file field run, these accounted for all 4 failed files.
+- **`wifi-transfer` recovers from two failures seen on firmware 1.8.** When
+  the device resets or closes a transfer connection before sending any of the
+  file, the file is tried once more on a fresh access point; any other failure
+  (part way through, no data, a full disk, a failed join) still fails the file.
+  When the device does not answer `APP&WIFIO`, raising the access point is
+  tried again with longer pauses (2, 5, 10 s), at the start as well as between
+  files; if the third try fails between files, the run stops instead of
+  repeating it for every remaining file. In a 12-file field run, these two
+  accounted for all 4 failed files.
 
 - **`status` reported a nearly full device as nearly empty, and vice versa.**
   `APP&SPACE` answers with *free* and total storage in **MB**
