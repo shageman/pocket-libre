@@ -139,7 +139,9 @@ The name comes from the device clock, which `APP&T&` sets. The vendor app sets
 it to UTC, and so does pocket-libre (`status`, the web UI). Names are UTC once
 either has set the clock.
 A client that sends local time instead leaves the clock in whichever zone was
-set last, and names flip between the two.
+set last, and names flip between the two. Names carry the start time in UTC,
+but because of forms like `PH…`, clients should still treat them as names, not
+parse them.
 
 ### USB Mass Storage
 

@@ -87,7 +87,11 @@ confirmed it on 1.7.
 - **`status` and the web UI set the device clock to local time.** The
   vendor app sets it to UTC, so the clock flipped between the two depending on
   which connected last, and recording names (which follow the clock) could be
-  hours off. `set_time()` now sends UTC.
+  hours off. `set_time()` now sends UTC, and takes a `datetime` instead of a
+  string. If you have only used pocket-libre so far, your recordings are named
+  in local time: from the first `status` after upgrading, new ones are named in
+  UTC, so names and date folders jump by your UTC offset at that point. Older
+  recordings keep their names. `--since` compares against those folder dates.
 - **A BLE disconnect mid-download crashed `download-all`** with `BleakError:
   Service Discovery has not been performed yet`, raised while unsubscribing
   from a link that was already gone. Without the crash it was worse: the
