@@ -535,6 +535,30 @@ def download(ctx, address: str | None, session_key: str | None,
     asyncio.run(_run())
 
 
+def _plan_downloads(jobs: list[tuple[Recording, Path]], overwrite: bool = False,
+                    hint: str = "") -> tuple[list[tuple[Recording, Path]], list[Path]]:
+    """Split (recording, path) jobs into those to download and the paths that
+    already have a copy, checking each path once, and say so in one line.
+
+    `hint` follows the "all already downloaded" message, e.g. how to download
+    again. Returns (todo, existing).
+    """
+    todo, existing = [], []
+    for rec, path in jobs:
+        if not overwrite and path.exists():
+            existing.append(path)
+        else:
+            todo.append((rec, path))
+    if not jobs:
+        console.print("[yellow]No recordings match.[/yellow]")
+    elif not todo:
+        console.print(f"{len(jobs)} recording(s) to consider, all already downloaded{hint}.")
+    else:
+        console.print(f"[bold]{len(todo)} recording(s) to download[/bold]"
+                      + (f" ({len(existing)} already downloaded)" if existing else ""))
+    return todo, existing
+
+
 @cli.command("download-all")
 @click.option("--address", default=None, help="BLE address of your Pocket device.")
 @click.option("--key", "session_key", default=None, help="Session key.")
@@ -568,26 +592,17 @@ def download_all(ctx, address: str | None, session_key: str | None,
 
         if since:
             all_recs = [r for r in all_recs if r.date >= since]
-        all_recs.sort(key=lambda r: (r.date, r.timestamp))
-
-        if not all_recs:
-            console.print("[yellow]No recordings found.[/yellow]")
-            return [], 0
 
         jobs = [(r, out_root / r.date / f"{r.timestamp}.mp3") for r in all_recs]
-        todo = [(r, p) for r, p in jobs if not p.exists()]
-        existing = [p for r, p in jobs if p.exists()]
+        todo, existing = _plan_downloads(jobs)
         if not todo:
-            console.print(f"{len(all_recs)} recording(s) on the device, all already downloaded.")
             return existing, 0
-        console.print(f"[bold]{len(todo)} recording(s) to download[/bold]"
-                      + (f" ({len(existing)} already downloaded)" if existing else "") + "\n")
+        console.print()
 
         # Each download gets its own connection, so a dropped link is
         # retried instead of ending the run (see download_with_retry).
         downloaded_paths, failed = list(existing), 0
         for i, (rec, out_path) in enumerate(todo, 1):
-            out_path.parent.mkdir(parents=True, exist_ok=True)
             console.print(
                 f"  [{i}/{len(todo)}] {rec.date}/{rec.timestamp} "
                 f"(~{rec.estimated_bytes // 1024:,} KB)..."
@@ -601,13 +616,27 @@ def download_all(ctx, address: str | None, session_key: str | None,
             data = await download_with_retry(address, session_key, rec, progress_callback=progress)
             console.print()
 
-            if data:
-                out_path.write_bytes(data)
-                downloaded_paths.append(out_path)
-                console.print(f"    [green]Saved {len(data):,} bytes[/green]")
-            else:
+            if not data:
                 failed += 1
                 console.print("    [red]Download failed; nothing saved. Re-run to try again.[/red]")
+                continue
+            # Written to a .part file first, so a full disk never leaves a
+            # truncated .mp3 that the next run would take as downloaded.
+            partial = out_path.with_name(out_path.name + ".part")
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                partial.write_bytes(data)
+                partial.replace(out_path)
+            except OSError as e:
+                failed += 1
+                try:
+                    partial.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                console.print(f"    [red]Could not write {out_path}: {e}[/red]")
+                continue
+            downloaded_paths.append(out_path)
+            console.print(f"    [green]Saved {len(data):,} bytes[/green]")
 
         console.print(f"\n[bold]{len(todo) - failed} downloaded, {failed} failed[/bold] "
                       f"(into {out_root})")
@@ -1144,27 +1173,23 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
 
             if date is not None:
                 rec = Recording(date=date, timestamp=timestamp, duration_s=0)
-                jobs = [(rec, Path(output) if output else Path(f"{timestamp}.mp3"))]
+                path = Path(output) if output else Path(f"{timestamp}.mp3")
+                if path.exists() and not overwrite:
+                    console.print(f"{path} already exists (use --overwrite to download "
+                                  "it again).")
+                    return 0, 0
+                todo = [(rec, path)]
             else:
                 recs = await cmd.list_all_recordings()
                 if since:
                     recs = [r for r in recs if r.date >= since]
-                recs.sort(key=lambda r: (r.date, r.timestamp))
                 jobs = [(r, out_root / r.date / f"{r.timestamp}.mp3") for r in recs]
-            todo = [(r, p) for r, p in jobs if overwrite or not p.exists()]
-            skipped = len(jobs) - len(todo)
-            if not jobs:
-                console.print("[yellow]No recordings on the device.[/yellow]")
-                return 0, 0
-            if not todo:
-                console.print(f"{len(jobs)} recording(s) on the device, all already downloaded.")
-                return 0, 0
-
-            console.print(
-                f"[bold]{len(todo)} recording(s) to download over WiFi[/bold]"
-                + (f" ({skipped} already downloaded)" if skipped else "") + ". "
-                "This machine's WiFi switches to the device's network until done."
-            )
+                todo, _ = _plan_downloads(jobs, overwrite,
+                                          hint=" (use --overwrite to download again)")
+                if not todo:
+                    return 0, 0
+            console.print("Over WiFi: this machine's WiFi switches to the device's "
+                          "network until done.")
             try:
                 host_wifi = backend(wifi_backend, DEFAULT_HOST, iface,
                                     lambda kind, text: log(text))

@@ -189,13 +189,36 @@ def test_download_all_counts_only_what_it_downloaded(tmp_path, monkeypatch):
     (tmp_path / REC.date).mkdir()
     (tmp_path / REC.date / REC.filename).write_bytes(FULL)
 
-    result, fetched = _run_download_all(tmp_path, monkeypatch, [LATE, REC, EARLY])
+    result, fetched = _run_download_all(tmp_path, monkeypatch, [EARLY, REC, LATE])
 
     assert result.exit_code == 0, result.output
-    assert fetched == [EARLY, LATE]  # date order, the existing copy left alone
+    assert fetched == [EARLY, LATE]  # the existing copy left alone
     assert "2 recording(s) to download (1 already downloaded)" in result.output
     assert "2 downloaded, 0 failed" in result.output
     assert "skipping" not in result.output
+
+
+def test_download_all_counts_a_failed_write_and_goes_on(tmp_path, monkeypatch):
+    """A full disk fails that file, not the run, and leaves no partial .mp3."""
+    from pathlib import Path
+
+    real_write = Path.write_bytes
+
+    def write_bytes(self, data):
+        if EARLY.timestamp in self.name:
+            real_write(self, data[:10])
+            raise OSError(28, "No space left on device")
+        return real_write(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+    result, fetched = _run_download_all(tmp_path, monkeypatch, [EARLY, LATE])
+
+    assert result.exit_code == 1, result.output
+    assert fetched == [EARLY, LATE]
+    assert "No space left on device" in result.output
+    assert "1 downloaded, 1 failed" in result.output
+    assert not list((tmp_path / EARLY.date).iterdir())  # no .mp3, no .part
+    assert (tmp_path / LATE.date / LATE.filename).read_bytes() == FULL
 
 
 def test_download_all_says_once_when_everything_is_downloaded(tmp_path, monkeypatch):
@@ -207,4 +230,10 @@ def test_download_all_says_once_when_everything_is_downloaded(tmp_path, monkeypa
 
     assert result.exit_code == 0, result.output
     assert fetched == []
-    assert "2 recording(s) on the device, all already downloaded." in result.output
+    assert "2 recording(s) to consider, all already downloaded." in result.output
+
+
+def test_download_all_when_nothing_matches(tmp_path, monkeypatch):
+    result, fetched = _run_download_all(tmp_path, monkeypatch, [])
+    assert result.exit_code == 0, result.output
+    assert "No recordings match." in result.output

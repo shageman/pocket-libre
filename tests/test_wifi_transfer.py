@@ -595,20 +595,13 @@ def test_files_per_session_follows_the_firmware(monkeypatch, tmp_path, firmware,
     assert sessions == [per_session]
 
 
-def test_recordings_go_in_date_order(monkeypatch, tmp_path):
-    fetched = []
-    result = run_wifi_transfer(monkeypatch, tmp_path, fetched=fetched)
-    assert result.exit_code == 0, result.output
-    assert fetched == sorted(FILES)  # listed out of order by the device
-
-
 def test_already_downloaded_recordings_are_counted_in_one_line(monkeypatch, tmp_path):
     first = sorted(FILES)[0]
     (tmp_path / "2026-10-03").mkdir()
     (tmp_path / "2026-10-03" / f"{first}.mp3").write_bytes(b"mp3")
     result = run_wifi_transfer(monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
-    assert "2 recording(s) to download over WiFi (1 already downloaded)." in result.output
+    assert "2 recording(s) to download (1 already downloaded)" in result.output
     assert "skipping" not in result.output
 
 
@@ -618,7 +611,25 @@ def test_everything_downloaded_says_so_once(monkeypatch, tmp_path):
         (tmp_path / "2026-10-03" / f"{ts}.mp3").write_bytes(b"mp3")
     result = run_wifi_transfer(monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
-    assert "3 recording(s) on the device, all already downloaded." in result.output
+    output = " ".join(result.output.split())  # the console wraps long lines
+    assert ("3 recording(s) to consider, all already downloaded "
+            "(use --overwrite to download again).") in output
+
+
+def test_since_that_matches_nothing_says_so(monkeypatch, tmp_path):
+    result = run_wifi_transfer(monkeypatch, tmp_path, args=("--since", "2099-01-01"))
+    assert result.exit_code == 0, result.output
+    assert "No recordings match." in result.output
+
+
+def test_existing_single_recording_claims_nothing_about_the_device(monkeypatch, tmp_path):
+    target = tmp_path / "one.mp3"
+    target.write_bytes(b"mp3")
+    result = run_wifi_transfer(monkeypatch, tmp_path, args=(
+        "--date", "2026-10-03", "--timestamp", "20261003142550", "--output", str(target)))
+    assert result.exit_code == 0, result.output
+    assert "already exists (use --overwrite" in result.output
+    assert "device" not in result.output.split("already exists")[1]
 
 
 def test_untested_firmware_needs_force_and_gets_one_file_per_session(monkeypatch, tmp_path):

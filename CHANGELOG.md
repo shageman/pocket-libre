@@ -87,11 +87,17 @@ confirmed it on 1.7.
 
 - **`download-all` counted skipped recordings as downloaded** and exited 0 when
   a download failed. It now reports "N downloaded, M failed" for the files it
-  tried and exits 1 if any failed.
-- `download-all` and `wifi-transfer` go through recordings in date order, and
-  print one line for recordings already downloaded ("2 recording(s) to
-  download (5 already downloaded)", or "… all already downloaded") instead of
-  one line per skipped file.
+  tried and exits 1 if any failed, or if authentication fails. A file it can't
+  write (a full disk, permissions) counts as one failure, leaves no partial
+  `.mp3`, and the remaining files are still tried.
+- `PocketCommander.list_all_recordings()` returns recordings oldest first,
+  whatever order the device lists them in, so `download-all`, `wifi-transfer`,
+  `sync`, `watch` and the web UI all go in date order.
+- `download-all` and `wifi-transfer` print one line for recordings already
+  downloaded ("2 recording(s) to download (5 already downloaded)", or "N
+  recording(s) to consider, all already downloaded") instead of one line per
+  skipped file, and "No recordings match." when nothing is left after
+  `--since`.
 - **`status` reported a nearly full device as nearly empty, and vice versa.**
   `APP&SPACE` answers with *free* and total storage in **MB**
   (`MCU&SPA&<free>&<total>`), not used and total in KB. A brand-new 64 GB

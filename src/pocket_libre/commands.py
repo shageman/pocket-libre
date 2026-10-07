@@ -357,7 +357,10 @@ class PocketCommander:
         return recordings
 
     async def list_all_recordings(self) -> list[Recording]:
-        """List all recordings across all dates."""
+        """List all recordings across all dates, oldest first.
+
+        Sorted by date and timestamp, whatever order the device lists them in.
+        """
         dirs = await self.list_dirs()
         all_recs = []
         for d in dirs:
@@ -366,7 +369,7 @@ class PocketCommander:
             # Brief pause between directory listings to avoid overwhelming device MCU
             if len(dirs) > 1:
                 await asyncio.sleep(0.2)
-        return all_recs
+        return sorted(all_recs, key=lambda r: (r.date, r.timestamp))
 
     # ── BLE File Transfer ────────────────────────
 
