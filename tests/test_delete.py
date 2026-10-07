@@ -12,6 +12,8 @@ from pocket_libre.commands import (
     Recording,
     download_checked,
     has_complete_copy,
+    mark_unverified,
+    needs_download,
     record_download,
     save_recording,
 )
@@ -33,13 +35,14 @@ def no_listing_pause(monkeypatch):
     monkeypatch.setattr(commands.asyncio, "sleep", sleep)
 
 
-def _write(root, rec, size, recorded=None):
-    """A copy of `rec` of `size` bytes; `recorded` is the size its download noted."""
+def _write(root, rec, size, recorded=None, duration_s=None):
+    """A copy of `rec` of `size` bytes; `recorded` is the size its download
+    noted, with the duration listed then (default: `rec`'s)."""
     path = root / rec.date / rec.filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"\xff" * size)
     if recorded is not None:
-        record_download(path, recorded)
+        record_download(path, recorded, rec.duration_s if duration_s is None else duration_s)
     return path
 
 
@@ -106,53 +109,115 @@ async def test_a_late_listing_is_asked_for_again():
 # ── has_complete_copy ───────────────────────────
 
 
-def test_copy_with_its_recorded_size(tmp_path):
-    assert has_complete_copy(_write(tmp_path, DONE, 389_408, recorded=389_408))
+def test_copy_with_its_recorded_size_and_duration(tmp_path):
+    assert has_complete_copy(_write(tmp_path, DONE, 389_408, recorded=389_408), DONE)
 
 
 def test_copy_one_byte_short_of_its_record(tmp_path):
-    assert not has_complete_copy(_write(tmp_path, SHORT, 389_407, recorded=389_408))
+    assert not has_complete_copy(_write(tmp_path, SHORT, 389_407, recorded=389_408), SHORT)
 
 
 def test_copy_without_a_record_never_counts(tmp_path):
     """Truncated files from older versions, whatever their size."""
-    assert not has_complete_copy(_write(tmp_path, OLD, 10_000_000))
+    assert not has_complete_copy(_write(tmp_path, OLD, 10_000_000), OLD)
+
+
+def test_recording_that_grew_after_its_download_is_kept(tmp_path):
+    """Downloaded while the device still listed 97 s; it lists 120 s now."""
+    path = _write(tmp_path, DONE, 389_408, recorded=389_408)
+    assert not has_complete_copy(path, Recording(DONE.date, DONE.timestamp, 120))
+
+
+def test_reused_name_is_kept(tmp_path):
+    """After a clock reset a new recording can get a name with a verified copy."""
+    path = _write(tmp_path, DONE, 389_408, recorded=389_408)
+    assert not has_complete_copy(path, Recording(DONE.date, DONE.timestamp, 3_600))
+
+
+def test_recording_without_a_listed_duration_is_kept(tmp_path):
+    path = _write(tmp_path, DONE, 389_408, recorded=389_408, duration_s=0)
+    assert not has_complete_copy(path, Recording(DONE.date, DONE.timestamp, 0))
 
 
 def test_recorded_copy_that_is_gone(tmp_path):
     path = _write(tmp_path, DONE, 389_408, recorded=389_408)
     path.unlink()
-    assert not has_complete_copy(path)
+    assert not has_complete_copy(path, DONE)
 
 
 def test_empty_copy(tmp_path):
-    assert not has_complete_copy(_write(tmp_path, DONE, 0, recorded=0))
+    assert not has_complete_copy(_write(tmp_path, DONE, 0, recorded=0), DONE)
 
 
 def test_unreadable_record(tmp_path):
     path = _write(tmp_path, DONE, 100)
     (path.parent / DOWNLOADS_FILE).write_text("{not json")
-    assert not has_complete_copy(path)
+    assert not has_complete_copy(path, DONE)
 
 
-def test_save_recording_records_the_size_and_keeps_other_records(tmp_path):
+def test_record_from_an_earlier_format_never_counts(tmp_path):
+    path = _write(tmp_path, DONE, 389_408)
+    (path.parent / DOWNLOADS_FILE).write_text(json.dumps({DONE.filename: 389_408}))
+    assert not has_complete_copy(path, DONE)
+
+
+def test_save_recording_records_size_and_duration_and_keeps_other_records(tmp_path):
     (tmp_path / DONE.date).mkdir()
     first = tmp_path / DONE.date / DONE.filename
     second = tmp_path / DONE.date / NEW.filename
-    save_recording(first, b"\xff" * 10, verified=True)
-    save_recording(second, b"\xff" * 20, verified=True)
+    save_recording(first, b"\xff" * 10, True, DONE)
+    save_recording(second, b"\xff" * 20, True, NEW)
     book = json.loads((tmp_path / DONE.date / DOWNLOADS_FILE).read_text())
-    assert book == {DONE.filename: 10, NEW.filename: 20}
-    assert has_complete_copy(first) and has_complete_copy(second)
+    assert book == {DONE.filename: {"size": 10, "duration_s": DONE.duration_s},
+                    NEW.filename: {"size": 20, "duration_s": NEW.duration_s}}
+    assert has_complete_copy(first, DONE) and has_complete_copy(second, NEW)
+    assert not needs_download(first)
+    assert not list((tmp_path / DONE.date).glob("*.part"))
 
 
-def test_save_recording_writes_but_does_not_record_unverified_data(tmp_path):
+def test_unverified_data_is_marked_and_downloaded_again(tmp_path):
     (tmp_path / DONE.date).mkdir()
     path = tmp_path / DONE.date / DONE.filename
-    save_recording(path, b"\xff" * 10, verified=False)
+    save_recording(path, b"\xff" * 10, False, DONE)
     assert path.read_bytes() == b"\xff" * 10
-    assert not (tmp_path / DONE.date / DOWNLOADS_FILE).exists()
-    assert not has_complete_copy(path)
+    assert not has_complete_copy(path, DONE)
+    assert needs_download(path)
+
+
+def test_unverified_data_replaces_an_older_record(tmp_path):
+    path = _write(tmp_path, DONE, 389_408, recorded=389_408)
+    save_recording(path, b"\xff" * 10, False, DONE)
+    assert not has_complete_copy(path, DONE)
+    assert needs_download(path)
+
+
+def test_a_failed_write_leaves_a_mark_and_no_partial_file(tmp_path, monkeypatch):
+    """A full disk (or a crash) part way through: the next run downloads again."""
+    (tmp_path / DONE.date).mkdir()
+    path = tmp_path / DONE.date / DONE.filename
+
+    def full(self, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(commands.Path, "write_bytes", full)
+    with pytest.raises(OSError):
+        save_recording(path, b"\xff" * 10, True, DONE)
+    monkeypatch.undo()
+    assert not path.exists() and not list((tmp_path / DONE.date).glob("*.part"))
+    assert needs_download(path)
+
+
+def test_a_copy_without_any_record_is_not_downloaded_again(tmp_path):
+    """Recordings downloaded before records were kept stay as they are."""
+    assert not needs_download(_write(tmp_path, OLD, 240_000))
+    assert needs_download(tmp_path / NEW.date / NEW.filename)
+
+
+def test_mark_unverified_before_writing(tmp_path):
+    (tmp_path / NEW.date).mkdir()
+    path = tmp_path / NEW.date / NEW.filename
+    mark_unverified(path)
+    assert needs_download(path)  # nothing there yet
 
 
 def test_concurrent_records_do_not_share_a_temporary_file(tmp_path, monkeypatch):
@@ -166,8 +231,8 @@ def test_concurrent_records_do_not_share_a_temporary_file(tmp_path, monkeypatch)
         return real_replace(self, target)
 
     monkeypatch.setattr(commands.Path, "replace", replace)
-    record_download(tmp_path / DONE.date / DONE.filename, 1)
-    record_download(tmp_path / DONE.date / NEW.filename, 2)
+    record_download(tmp_path / DONE.date / DONE.filename, 1, 1)
+    record_download(tmp_path / DONE.date / NEW.filename, 2, 1)
     assert len(set(names)) == 2
     assert not list((tmp_path / DONE.date).glob("*.tmp"))
 
@@ -294,15 +359,20 @@ class _Device:
     async def list_files(self, date):
         return [r for r in _Device.recordings if r.date == date]
 
+    lists = 0
+
     async def list_files_complete(self, date):
+        _Device.lists += 1
         return await self.list_files(date)
 
-    async def delete(self, rec):
+    async def delete_and_list(self, rec):
         # The device goes by date and timestamp; `delete --date` has no duration.
         match = next(r for r in _Device.recordings if r.timestamp == rec.timestamp)
         _Device.recordings.remove(match)
         _Device.deleted.append(match)
-        return True if _Device.confirms else None
+        if not _Device.confirms:
+            return None, None
+        return True, await self.list_files_complete(rec.date)
 
 
 @pytest.fixture
@@ -312,6 +382,7 @@ def device(tmp_path, monkeypatch):
     _Device.recordings = [DONE, SHORT, OLD, NEW]
     _Device.deleted = []
     _Device.confirms = True
+    _Device.lists = 0
     _write(tmp_path, DONE, 389_408, recorded=389_408)
     _write(tmp_path, SHORT, 1_000_000, recorded=14_736_000)
     _write(tmp_path, OLD, 240_000)
@@ -410,3 +481,22 @@ def test_delete_pass_that_cannot_connect_says_what_to_do(device, tmp_path, monke
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "delete --downloaded" in " ".join(result.output.split())
     assert device.deleted == []
+
+
+def test_delete_downloaded_keeps_a_recording_that_grew(device, tmp_path):
+    grown = Recording(DONE.date, DONE.timestamp, 120)  # downloaded at 97 s
+    device.recordings = [grown, NEW]
+    result = _run("delete", "--downloaded", "--yes", "--output-dir", str(tmp_path))
+    assert result.exit_code == 0, result.output
+    assert device.deleted == []
+    assert "Keeping" in result.output
+
+
+def test_deleting_several_on_one_date_lists_it_once_per_deletion(device, tmp_path):
+    second = Recording(DONE.date, "20261003081900", 50)
+    _write(tmp_path, second, 200_000, recorded=200_000)
+    device.recordings = [DONE, second, NEW]
+    result = _run("delete", "--downloaded", "--yes", "--output-dir", str(tmp_path))
+    assert result.exit_code == 0, result.output
+    assert device.deleted == [DONE, second]
+    assert device.lists == 3  # one before the first, one after each deletion

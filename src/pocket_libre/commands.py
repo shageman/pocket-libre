@@ -15,8 +15,8 @@ import asyncio
 import json
 import os
 import re
-import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,12 +89,14 @@ class Recording:
         )
 
 
-# Next to the recordings of each date: the size of every file a verified
-# download wrote there, {"<timestamp>.mp3": <bytes>}.
+# Next to the recordings of each date, what each download wrote there:
+# {"<timestamp>.mp3": {"size": <bytes>, "duration_s": <seconds listed>}} for a
+# verified download, {"<timestamp>.mp3": {"verified": false}} for one that
+# couldn't be checked (or is being written).
 DOWNLOADS_FILE = ".downloads.json"
 
 
-def _downloads(directory: Path) -> dict[str, int]:
+def _downloads(directory: Path) -> dict:
     try:
         entries = json.loads((directory / DOWNLOADS_FILE).read_text())
     except (OSError, ValueError):
@@ -102,56 +104,95 @@ def _downloads(directory: Path) -> dict[str, int]:
     return entries if isinstance(entries, dict) else {}
 
 
-def record_download(path, size: int) -> None:
-    """Note that a verified download wrote `size` bytes to `path`.
+def _set_entry(path: Path, entry: dict) -> None:
+    entries = _downloads(path.parent)
+    entries[path.name] = entry
+    # A temp name of its own: another process may be saving to this date too.
+    # If both do, one record can be lost, which only keeps a recording. Opened
+    # like any other new file, so it gets the usual mode: a service saving
+    # recordings and a user deleting them can share it.
+    tmp = path.parent / f"{DOWNLOADS_FILE}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "x") as fh:
+            fh.write(json.dumps(entries, indent=1, sort_keys=True) + "\n")
+        tmp.replace(path.parent / DOWNLOADS_FILE)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def record_download(path, size: int, duration_s: int) -> None:
+    """Note that a verified download of a recording listed with `duration_s`
+    wrote `size` bytes to `path`.
 
     Only a download that checked the size the device announces may call
     this; has_complete_copy() relies on it before deleting from the device.
     """
-    path = Path(path)
-    entries = _downloads(path.parent)
-    entries[path.name] = size
-    # A temp name of its own: another process may be saving to this date too.
-    # If both do, one record can be lost, which only keeps a recording.
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=DOWNLOADS_FILE + ".", suffix=".tmp")
-    try:
-        # mkstemp makes the file 0600; give it the mode any other file would get,
-        # so a service saving recordings and a user deleting them can share it.
-        mask = os.umask(0)
-        os.umask(mask)
-        os.chmod(tmp, 0o666 & ~mask)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(entries, indent=1, sort_keys=True) + "\n")
-        Path(tmp).replace(path.parent / DOWNLOADS_FILE)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    _set_entry(Path(path), {"size": size, "duration_s": duration_s})
 
 
-def save_recording(path, data: bytes, verified: bool) -> None:
-    """Write a download to `path`, and record its size if `verified`
-    (see download_checked)."""
-    path = Path(path)
-    path.write_bytes(data)
-    if verified:
-        record_download(path, len(data))
+def mark_unverified(path) -> None:
+    """Note that `path` holds (or is about to hold) a download that wasn't
+    checked against the announced size: never deleted, downloaded again."""
+    _set_entry(Path(path), {"verified": False})
 
 
-def has_complete_copy(path) -> bool:
-    """True if `path` has exactly the size a verified download recorded for it.
+def save_recording(path, data: bytes, verified: bool, recording: Recording) -> None:
+    """Write a download to `path`, and record it if `verified` (see
+    download_checked).
 
-    A file without a record (one downloaded before sizes were recorded, which
-    older versions may have saved cut short, or one put there by something
-    else) never counts, whatever its size, and neither does a file whose size changed
-    since. Deleting from the device can't be undone, so this errs towards
-    keeping recordings.
+    The file is marked unverified first and written through a .part file, so
+    a crash or full disk at any point leaves either that mark (the next run
+    downloads it again) or a complete, recorded copy.
     """
     path = Path(path)
-    recorded = _downloads(path.parent).get(path.name)
-    if not isinstance(recorded, int) or recorded <= 0:
+    partial = path.with_name(path.name + ".part")
+    mark_unverified(path)
+    try:
+        partial.write_bytes(data)
+        partial.replace(path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    if verified:
+        record_download(path, len(data), recording.duration_s)
+
+
+def needs_download(path) -> bool:
+    """True if `path` is missing, or holds a download marked unverified.
+
+    A file without any record (one from before records were kept) counts as
+    downloaded, as it always has.
+    """
+    path = Path(path)
+    if not path.exists():
+        return True
+    entry = _downloads(path.parent).get(path.name)
+    return isinstance(entry, dict) and entry.get("verified") is False
+
+
+def has_complete_copy(path, listed: Recording) -> bool:
+    """True if `path` is a verified download of the recording the device lists
+    now as `listed`.
+
+    The file must have exactly the size its download recorded, and the device
+    must list the same duration it did then, so a recording that grew after
+    it was downloaded, or a name reused for a new recording, is kept. A file
+    without a record (downloaded before records were kept, which older
+    versions may have saved cut short, or put there by something else) never
+    counts, whatever its size. Deleting from the device can't be undone, so
+    this errs towards keeping recordings.
+    """
+    path = Path(path)
+    entry = _downloads(path.parent).get(path.name)
+    if not isinstance(entry, dict):
+        return False
+    size, duration_s = entry.get("size"), entry.get("duration_s")
+    if not (isinstance(size, int) and size > 0 and isinstance(duration_s, int)
+            and duration_s > 0 and duration_s == listed.duration_s):
         return False
     try:
-        return path.stat().st_size == recorded
+        return path.stat().st_size == size
     except OSError:
         return False
 
@@ -499,11 +540,18 @@ class PocketCommander:
         APP&D&<date>&<timestamp> is answered by a bare MCU&D that carries no
         status, so the listing is the only confirmation.
         """
+        gone, _ = await self.delete_and_list(recording)
+        return gone
+
+    async def delete_and_list(self, recording: Recording
+                              ) -> tuple[bool | None, list[Recording] | None]:
+        """delete(), plus the complete listing of the date it was checked
+        against (None without one), for a caller deleting several."""
         await self._send(f"D&{recording.date}&{recording.timestamp}")
         remaining = await self.list_files_complete(recording.date)
         if remaining is None:
-            return None
-        return all(r.timestamp != recording.timestamp for r in remaining)
+            return None, None
+        return all(r.timestamp != recording.timestamp for r in remaining), remaining
 
     # ── BLE File Transfer ────────────────────────
 

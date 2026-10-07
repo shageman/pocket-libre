@@ -547,9 +547,12 @@ def _plan_downloads(jobs: list[tuple[Recording, Path]], listed: int,
     them. `hint` follows the "all already downloaded" message, e.g. how to
     download again. Returns (todo, existing).
     """
+    from pocket_libre.commands import needs_download
+
     todo, existing = [], []
     for rec, path in jobs:
-        if not overwrite and path.exists():
+        # A copy marked unverified is downloaded again (see save_recording).
+        if not overwrite and not needs_download(path):
             existing.append(path)
         else:
             todo.append((rec, path))
@@ -589,7 +592,7 @@ def download_all(ctx, address: str | None, session_key: str | None,
     address = _require_address(address, config)
     session_key = _require_session_key(session_key, config)
     out_root = Path(get_output_dir(config, output_dir))
-    from pocket_libre.commands import download_checked, record_download
+    from pocket_libre.commands import download_checked, save_recording
 
     async def _run():
         async with PocketCommander(address) as cmd:
@@ -631,21 +634,13 @@ def download_all(ctx, address: str | None, session_key: str | None,
                 failed += 1
                 console.print("    [red]Download failed; nothing saved. Re-run to try again.[/red]")
                 continue
-            # Written to a .part file first, so a full disk never leaves a
-            # truncated .mp3 that the next run would take as downloaded.
-            partial = out_path.with_name(out_path.name + ".part")
+            # save_recording writes through a .part file, so a full disk never
+            # leaves a truncated .mp3 that the next run would take as downloaded.
             try:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                partial.write_bytes(data)
-                partial.replace(out_path)
-                if verified:
-                    record_download(out_path, len(data))
+                save_recording(out_path, data, verified, rec)
             except OSError as e:
                 failed += 1
-                try:
-                    partial.unlink(missing_ok=True)
-                except OSError:
-                    pass
                 console.print(f"    [red]Could not write {out_path}: {e}[/red]")
                 continue
             downloaded_paths.append(out_path)
@@ -683,18 +678,24 @@ async def _delete_recordings(address: str, session_key: str,
     async with PocketCommander(address) as cmd:
         if not await cmd.authenticate(session_key):
             raise click.ClickException("Authentication failed.")
+        listings: dict[str, list[Recording]] = {}  # per date, as last listed
         for rec in recs:
             name = f"{rec.date}/{rec.timestamp}"
             # delete() checks the listing afterwards, which can't tell a
-            # deletion from a recording that was never there.
-            listed = await cmd.list_files_complete(rec.date)
+            # deletion from a recording that was never there. The listing a
+            # deletion was confirmed with serves as the next one's "before".
+            listed = listings.pop(rec.date, None)
+            if listed is None:
+                listed = await cmd.list_files_complete(rec.date)
             if listed is None:
                 console.print(f"  [red]Could not list {rec.date}; kept {name}.[/red]")
                 continue
             if all(r.timestamp != rec.timestamp for r in listed):
                 console.print(f"  [red]{name} is not on the device.[/red]")
                 continue
-            gone = await cmd.delete(rec)
+            gone, remaining = await cmd.delete_and_list(rec)
+            if remaining is not None:
+                listings[rec.date] = remaining
             if gone:
                 deleted += 1
                 console.print(f"  [green]Deleted {name}[/green]")
@@ -737,11 +738,11 @@ def _delete_downloaded(address: str, session_key: str, out_root: Path,
             time.sleep(5)
     if since:
         recs = [r for r in recs if r.date >= since]
-    done = [r for r in recs if has_complete_copy(out_root / r.date / r.filename)]
+    done = [r for r in recs if has_complete_copy(out_root / r.date / r.filename, r)]
     for r in recs:
         if r not in done:
-            console.print(f"  [yellow]Keeping {r} (no copy in {out_root} with the size "
-                          "its download recorded)[/yellow]")
+            console.print(f"  [yellow]Keeping {r} (no copy in {out_root} that its download "
+                          "verified for this size and duration)[/yellow]")
     if not done:
         console.print("[dim]Nothing to delete.[/dim]")
         return
@@ -848,7 +849,7 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
     transcribes with Whisper (locally) and summarizes with Claude Haiku
     (~$0.001 per recording). Skips recordings already on disk.
     """
-    from pocket_libre.commands import download_checked, save_recording
+    from pocket_libre.commands import download_checked, needs_download, save_recording
 
     config = ctx.obj["config"]
     address = _require_address(address, config)
@@ -891,7 +892,7 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
         new_recs = []
         for rec in all_recs:
             mp3_path = out_root / rec.date / f"{rec.timestamp}.mp3"
-            if not mp3_path.exists():
+            if needs_download(mp3_path):
                 new_recs.append(rec)
 
         if not new_recs:
@@ -921,7 +922,7 @@ def sync(ctx, address: str | None, output_dir: str | None, since: str | None,
                 console.print("  [red]Failed to download.[/red]")
                 continue
 
-            save_recording(audio_path, data, verified)
+            save_recording(audio_path, data, verified, rec)
             console.print(f"  [green]Saved {len(data):,} bytes[/green]")
 
             if skip_process:
@@ -1278,7 +1279,7 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
     """
     from bleak.exc import BleakError
 
-    from pocket_libre.commands import is_safe_id, record_download
+    from pocket_libre.commands import is_safe_id, mark_unverified, record_download
     from pocket_libre.hostwifi import HostWifiError, backend
     from pocket_libre.protocol import FILES_PER_AP_SESSION
     from pocket_libre.wifi import (
@@ -1378,6 +1379,10 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
                             console.print(f"\r    [dim]{current:,}/{total:,} bytes ({pct}%)[/dim]",
                                           end="")
 
+                        # Marked until it is recorded, so a crash in between
+                        # leaves a copy the next run downloads again.
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        mark_unverified(path)
                         try:
                             result = await session.download(rec, path, progress_callback=progress)
                         except (WifiTransferError, BleakError) as e:
@@ -1398,7 +1403,7 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
                                                   "not attempted.[/yellow]")
                                 break
                             continue
-                        record_download(result.path, result.size)
+                        record_download(result.path, result.size, rec.duration_s)
                         rate = result.size / result.seconds / 1024 if result.seconds else 0
                         console.print(
                             f"\n    [green]Saved {result.size:,} bytes to {result.path} "

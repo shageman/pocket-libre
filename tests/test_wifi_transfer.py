@@ -818,11 +818,12 @@ def test_wifi_transfer_records_the_size_of_each_download(monkeypatch, tmp_path):
     """delete --downloaded only trusts a copy whose size its download recorded."""
     import json
 
-    from pocket_libre.commands import DOWNLOADS_FILE, has_complete_copy
+    from pocket_libre.commands import DOWNLOADS_FILE
 
     result = run_wifi_transfer(monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
     copies = list(tmp_path.glob("*/*.mp3"))
-    assert copies and all(has_complete_copy(p) for p in copies)
+    assert copies
     book = json.loads((copies[0].parent / DOWNLOADS_FILE).read_text())
-    assert set(book) == {p.name for p in copies if p.parent == copies[0].parent}
+    # The stub device lists every recording with duration 0 and sends 3 bytes.
+    assert book == {p.name: {"size": 3, "duration_s": 0} for p in copies}

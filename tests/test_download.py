@@ -223,7 +223,8 @@ def test_download_all_counts_a_failed_write_and_goes_on(tmp_path, monkeypatch):
     assert fetched == [EARLY, LATE]
     assert "No space left on device" in _flat(result)
     assert "1 downloaded, 1 failed" in _flat(result)
-    assert not list((tmp_path / EARLY.date).iterdir())  # no .mp3, no .part
+    assert not list((tmp_path / EARLY.date).glob("*.mp3*"))  # no .mp3, no .part
+    assert commands.needs_download(tmp_path / EARLY.date / EARLY.filename)  # tried again
     assert (tmp_path / LATE.date / LATE.filename).read_bytes() == FULL
 
 
