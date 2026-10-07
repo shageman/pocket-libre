@@ -13,7 +13,9 @@ Usage:
 
 import asyncio
 import json
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -92,6 +94,17 @@ class Recording:
 DOWNLOADS_FILE = ".downloads.json"
 
 
+class VerifiedDownload(bytes):
+    """A recording whose length matched the size the device announced.
+
+    download_with_retry returns one when it could check; save_recording
+    records the size of nothing else. Slicing gives plain bytes, which
+    is unverified again.
+    """
+
+    verified = True
+
+
 def _downloads(directory: Path) -> dict[str, int]:
     try:
         entries = json.loads((directory / DOWNLOADS_FILE).read_text())
@@ -109,17 +122,24 @@ def record_download(path, size: int) -> None:
     path = Path(path)
     entries = _downloads(path.parent)
     entries[path.name] = size
-    book = path.parent / DOWNLOADS_FILE
-    tmp = book.with_name(book.name + ".tmp")
-    tmp.write_text(json.dumps(entries, indent=1, sort_keys=True) + "\n")
-    tmp.replace(book)
+    # A temp name of its own: another process may be saving to this date too.
+    # If both do, one record can be lost, which only keeps a recording.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=DOWNLOADS_FILE + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(entries, indent=1, sort_keys=True) + "\n")
+        Path(tmp).replace(path.parent / DOWNLOADS_FILE)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def save_recording(path, data: bytes) -> None:
-    """Write a verified download to `path` and record its size."""
+    """Write a download to `path`, and record its size if it was verified."""
     path = Path(path)
     path.write_bytes(data)
-    record_download(path, len(data))
+    if getattr(data, "verified", False):
+        record_download(path, len(data))
 
 
 def has_complete_copy(path) -> bool:
@@ -411,7 +431,11 @@ class PocketCommander:
         matches the MCU&F entries. Without that, an empty or short answer
         can't be told from a reply that came too late for _send.
         """
-        for _ in range(tries):
+        for attempt in range(tries):
+            if attempt:
+                # Let a late answer to the last LIST arrive, so _send drops it
+                # instead of mixing it into the next one.
+                await asyncio.sleep(1.0)
             recordings, complete = self._parse_listing(await self._send(f"LIST&{date}"))
             if complete:
                 return recordings
@@ -419,9 +443,12 @@ class PocketCommander:
 
     @staticmethod
     def _parse_listing(responses: list[str]) -> tuple[list[Recording], bool]:
-        """The recordings in a LIST answer, and whether the answer was complete."""
+        """The recordings in a LIST answer, and whether the answer was complete.
+
+        Only entries that parse count towards completeness: a garbled line
+        makes the listing incomplete rather than silently shorter.
+        """
         recordings = []
-        entries = 0
         count = None
         for r in responses:
             if r.startswith(f"{RSP_PREFIX}LIST&"):
@@ -430,7 +457,6 @@ class PocketCommander:
                 continue
             if not r.startswith(f"{RSP_PREFIX}F&"):
                 continue
-            entries += 1
             # MCU&F&2026-03-28&20260328001919&6222
             # The trailing field is a duration in seconds (see protocol.py).
             parts = r.split("&")
@@ -445,7 +471,7 @@ class PocketCommander:
                     continue
                 duration_s = int(parts[4]) if parts[4].isdigit() else 0
                 recordings.append(Recording(rec_date, timestamp, duration_s))
-        return recordings, count == entries
+        return recordings, count == len(recordings)
 
     async def list_all_recordings(self) -> list[Recording]:
         """List all recordings across all dates, oldest first.
@@ -644,7 +670,8 @@ async def download_with_retry(
     short data, waits briefly and retries from scratch. A partial transfer
     is never returned: callers write whatever comes back to its final path.
 
-    Returns MP3 bytes (trimmed to sync word) or empty bytes on total failure.
+    Returns MP3 bytes (trimmed to sync word) or empty bytes on total failure:
+    a VerifiedDownload when they are exactly the size the device announced.
     """
     from pocket_libre.protocol import MP3_SYNC_WORD
 
@@ -690,6 +717,10 @@ async def download_with_retry(
                         )
                         continue
 
+                # Verified only if there was an announced size and the file
+                # is exactly that long; anything else is still returned.
+                if 0 < expected_size == len(data):
+                    return VerifiedDownload(data)
                 return data
 
         except Exception as e:

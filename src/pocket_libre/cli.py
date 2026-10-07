@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from pathlib import Path
 
 import click
@@ -510,7 +511,7 @@ def download(ctx, address: str | None, session_key: str | None,
     config = ctx.obj["config"]
     address = _require_address(address, config)
     session_key = _require_session_key(session_key, config)
-    from pocket_libre.commands import download_with_retry, save_recording
+    from pocket_libre.commands import download_with_retry
 
     async def _run():
         rec = Recording(date=date, timestamp=timestamp, duration_s=0)
@@ -528,8 +529,9 @@ def download(ctx, address: str | None, session_key: str | None,
             console.print("[red]Download failed; nothing saved.[/red]")
             return
 
+        # Not recorded: delete --downloaded only looks in <output dir>/<date>/.
         out_path = Path(output) if output else Path(f"{timestamp}.mp3")
-        save_recording(out_path, data)
+        out_path.write_bytes(data)
         console.print(f"[bold green]Saved {len(data):,} bytes to {out_path}[/bold green]")
 
     asyncio.run(_run())
@@ -1281,7 +1283,11 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
     def log(text: str) -> None:
         console.print(f"[dim]{text}[/dim]")
 
+    link_lost = False
+
     def lost_link(error: Exception | None, not_attempted: int) -> None:
+        nonlocal link_lost
+        link_lost = True
         detail = f": {error}" if error else ""
         console.print(f"\n[red]Lost the BLE link{detail}[/red]")
         if not_attempted:
@@ -1396,7 +1402,12 @@ def wifi_transfer(ctx, address: str | None, session_key: str | None, date: str |
 
     if done or failed:
         console.print(f"\n[bold]{done} downloaded, {failed} failed.[/bold]")
-    if delete_after:
+    if delete_after and link_lost:
+        console.print("[yellow]Not deleting anything from the device: the BLE link was "
+                      "lost. Run `pocket-libre delete --downloaded` once it connects "
+                      "again.[/yellow]")
+    elif delete_after:
+        time.sleep(3)  # let the device leave AP mode before listing over BLE
         _delete_downloaded(address, session_key, out_root, since, assume_yes=True)
     if failed:
         raise SystemExit(1)

@@ -58,9 +58,11 @@ confirmed it on 1.7.
   unless you pass `--yes`. `sync`, `download-all` and `wifi-transfer` take
   `--delete-after` to do the same once they finish. A copy counts as verified
   only if its size matches, to the byte, the size its download recorded in
-  `<date>/.downloads.json`; downloads record it once they have checked the size
-  the device announced. Copies without a record, such as ones downloaded by
-  earlier versions, are always kept, as are downloads from the web UI. Each
+  `<date>/.downloads.json`. `download-all`, `sync`, `wifi-transfer` and `watch`
+  record it only when the file is exactly the size the device announced.
+  Copies without a record are always kept: ones downloaded by earlier
+  versions, by the web UI or by `download`, and any download whose announced
+  size was missed. Each
   deletion is confirmed by a complete listing of the date (one that ends in
   `MCU&LIST&<count>` with that many entries), because the device's `MCU&D`
   reply carries no status; without one, the deletion is reported as

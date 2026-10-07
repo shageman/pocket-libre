@@ -583,6 +583,30 @@ def test_an_access_point_that_never_comes_back_stops_the_batch(monkeypatch, tmp_
     assert "1 downloaded, 1 failed" in result.output
 
 
+@pytest.mark.parametrize("fail", [_bleak_error, _silent_disconnect])
+def test_delete_after_is_skipped_once_the_ble_link_is_lost(monkeypatch, tmp_path, fail):
+    from pocket_libre import cli as cli_module
+
+    calls = []
+    monkeypatch.setattr(cli_module, "_delete_downloaded", lambda *a, **kw: calls.append(a))
+    result = run_wifi_transfer(monkeypatch, tmp_path, fail, args=("--delete-after",))
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert calls == []
+    assert "Not deleting" in result.output
+
+
+def test_delete_after_runs_after_a_clean_transfer(monkeypatch, tmp_path):
+    from pocket_libre import cli as cli_module
+
+    calls = []
+    monkeypatch.setattr(cli_module, "_delete_downloaded", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(cli_module.time, "sleep", lambda s: None)
+    result = run_wifi_transfer(monkeypatch, tmp_path, args=("--delete-after",))
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
 def test_transfer_error_with_the_link_up_moves_on(monkeypatch, tmp_path):
     def fail(cmd):
         raise WifiTransferError("no data")

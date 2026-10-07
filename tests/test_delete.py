@@ -10,6 +10,8 @@ from pocket_libre.commands import (
     DOWNLOADS_FILE,
     PocketCommander,
     Recording,
+    VerifiedDownload,
+    download_with_retry,
     has_complete_copy,
     record_download,
     save_recording,
@@ -127,11 +129,107 @@ def test_save_recording_records_the_size_and_keeps_other_records(tmp_path):
     (tmp_path / DONE.date).mkdir()
     first = tmp_path / DONE.date / DONE.filename
     second = tmp_path / DONE.date / NEW.filename
-    save_recording(first, b"\xff" * 10)
-    save_recording(second, b"\xff" * 20)
+    save_recording(first, VerifiedDownload(b"\xff" * 10))
+    save_recording(second, VerifiedDownload(b"\xff" * 20))
     book = json.loads((tmp_path / DONE.date / DOWNLOADS_FILE).read_text())
     assert book == {DONE.filename: 10, NEW.filename: 20}
     assert has_complete_copy(first) and has_complete_copy(second)
+
+
+def test_save_recording_writes_but_does_not_record_unverified_data(tmp_path):
+    (tmp_path / DONE.date).mkdir()
+    path = tmp_path / DONE.date / DONE.filename
+    save_recording(path, b"\xff" * 10)
+    assert path.read_bytes() == b"\xff" * 10
+    assert not (tmp_path / DONE.date / DOWNLOADS_FILE).exists()
+    assert not has_complete_copy(path)
+
+
+def test_concurrent_records_do_not_share_a_temporary_file(tmp_path, monkeypatch):
+    """Two processes saving to one date must not move each other's temp file."""
+    (tmp_path / DONE.date).mkdir()
+    names = []
+    real_replace = commands.Path.replace
+
+    def replace(self, target):
+        names.append(self.name)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(commands.Path, "replace", replace)
+    record_download(tmp_path / DONE.date / DONE.filename, 1)
+    record_download(tmp_path / DONE.date / NEW.filename, 2)
+    assert len(set(names)) == 2
+    assert not list((tmp_path / DONE.date).glob("*.tmp"))
+
+
+class _BleCommander:
+    """download_with_retry's view of a BLE download."""
+
+    announced = 0
+    data = b""
+
+    def __init__(self, address):
+        self._disconnected = False
+        self.last_expected_size = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def authenticate(self, key):
+        return True
+
+    async def download_ble(self, rec, progress_callback=None):
+        self.last_expected_size = _BleCommander.announced
+        return _BleCommander.data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("announced, data, verified", [
+    (9_836, b"\xff\xf3" * 4_918, True),        # the announced size, exactly
+    (0, b"\xff\xf3" * 4_918, False),           # MCU&U&<size> missed: nothing to check against
+    (9_000, b"\xff\xf3" * 4_918, False),       # more than announced
+])
+async def test_download_is_verified_only_against_the_announced_size(monkeypatch, announced,
+                                                                    data, verified):
+    monkeypatch.setattr(commands, "PocketCommander", _BleCommander)
+    _BleCommander.announced, _BleCommander.data = announced, data
+    result = await download_with_retry("addr", "k", Recording("d", "t", 0), max_retries=1)
+    assert result == data
+    assert getattr(result, "verified", False) is verified
+
+
+@pytest.mark.asyncio
+async def test_listing_is_asked_for_again_after_a_pause(monkeypatch):
+    """Late replies to the first LIST must not mix into the second."""
+    events = []
+    real_sleep = commands.asyncio.sleep
+
+    async def sleep(seconds):
+        events.append(f"sleep {seconds}")
+        await real_sleep(0)
+
+    monkeypatch.setattr(commands.asyncio, "sleep", sleep)
+    answers = iter([_listing(NEW)[:-1], _listing(NEW)])
+
+    def answer(command):
+        events.append(command)
+        return next(answers)
+
+    cmd, _ = _commander(answer)
+    assert await cmd.list_files_complete(NEW.date) == [NEW]
+    assert events[0] == "LIST&2026-10-03" and events[-1] == "LIST&2026-10-03"
+    assert any(e.startswith("sleep") for e in events[1:-1])
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_entry_makes_the_listing_incomplete():
+    """A garbled line for the recording must not pass as a complete listing without it."""
+    garbled = ["MCU&F&2026-10-03&../../x&97", *_listing(NEW, count=2)]
+    cmd, _ = _commander(lambda c: ["MCU&D"] if c.startswith("D&") else garbled)
+    assert await cmd.delete(DONE) is None
 
 
 # ── CLI ─────────────────────────────────────────
@@ -238,7 +336,7 @@ def test_delete_rejects_bad_arguments(device, args):
 
 def test_download_all_delete_after(device, tmp_path, monkeypatch):
     async def download(address, key, rec, progress_callback=None):
-        return b"\xff" * rec.estimated_bytes if rec == NEW else b""
+        return VerifiedDownload(b"\xff" * rec.estimated_bytes) if rec == NEW else b""
 
     monkeypatch.setattr(commands, "download_with_retry", download)
     result = _run("download-all", "--output-dir", str(tmp_path), "--delete-after")
@@ -252,3 +350,15 @@ def test_wifi_transfer_delete_after_is_for_a_batch(device):
                   "--delete-after")
     assert result.exit_code == 2
     assert device.deleted == []
+
+
+def test_download_does_not_record_into_the_current_directory(device, tmp_path, monkeypatch):
+    async def download(address, key, rec, progress_callback=None):
+        return VerifiedDownload(b"\xff" * 100)
+
+    monkeypatch.setattr(commands, "download_with_retry", download)
+    monkeypatch.chdir(tmp_path)
+    result = _run("download", "--date", NEW.date, "--timestamp", NEW.timestamp)
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / NEW.filename).exists()
+    assert not (tmp_path / DOWNLOADS_FILE).exists()
