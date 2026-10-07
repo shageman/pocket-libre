@@ -325,6 +325,13 @@ def _discard(partial: Path) -> None:
         pass
 
 
+def _transfer_failed(received: int, message: str) -> WifiTransferError:
+    """The error for a transfer that ended early: ConnectionDroppedError if
+    none of the file had arrived, which the caller may retry."""
+    error = ConnectionDroppedError if received == 0 else WifiTransferError
+    return error(message)
+
+
 async def receive_file(
     reader: asyncio.StreamReader,
     size: int,
@@ -359,15 +366,13 @@ async def receive_file(
                         f"{what} after {timeout:g}s (expected {size:,} bytes)"
                     ) from None
                 except OSError as e:  # e.g. reset by the device
-                    error = ConnectionDroppedError if received == 0 else WifiTransferError
-                    raise error(
-                        f"connection lost at {received:,} of {size:,} bytes: {e}"
+                    raise _transfer_failed(
+                        received, f"connection lost at {received:,} of {size:,} bytes: {e}"
                     ) from e
                 if not chunk:
                     # Depending on the platform, a reset can also read as a close.
-                    error = ConnectionDroppedError if received == 0 else WifiTransferError
-                    raise error(
-                        f"device closed the connection at {received:,} of {size:,} bytes"
+                    raise _transfer_failed(
+                        received, f"device closed the connection at {received:,} of {size:,} bytes"
                     )
                 timeout = idle_timeout
                 body = chunk[: size - received]

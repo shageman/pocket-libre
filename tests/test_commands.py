@@ -192,20 +192,30 @@ class _RecordingSend:
 
 
 @pytest.fixture
-def kolkata(monkeypatch):
+def kolkata():
     """Local time five and a half hours off UTC, so sending it would show.
 
-    CI runners are on UTC, where local time and UTC agree.
+    CI runners are on UTC, where local time and UTC agree. A POSIX zone
+    string needs no tzdata; the check below makes sure it took effect, so the
+    tests can't pass vacuously on a machine that ignores it.
     """
+    import os
     import time
 
     if not hasattr(time, "tzset"):
         pytest.skip("time.tzset() is not available on Windows")
-    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = "IST-05:30"
     time.tzset()
-    yield
-    monkeypatch.undo()
-    time.tzset()
+    try:
+        assert time.timezone == -19800, "the local zone did not change"
+        yield
+    finally:
+        if old is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
 
 
 @pytest.mark.asyncio
